@@ -4,10 +4,12 @@ The public repository (mattthewhiggins/duo-paper on GitHub) runs the paper test 
 (.github/workflows/paper.yml). It gets the files on WHITELIST and nothing else: no data/, no .env, no .venv, and none of
 the research write-ups, results or audit, which are kept privately.
 
-The copy is made in a temporary folder and checked there first. If any file is called .env, or holds a path into a
-Mac's home folders, an email address or something that looks like a key, it stops, naming the file and line, and
-TARGET_DIR is left as it was. The only addresses allowed are GitHub's users.noreply.github.com ones and those at the
-names reserved for examples (example.com, .test and the like), which can't be anyone's.
+The copy is made in a temporary folder and checked there first. If any file is called .env, isn't UTF-8 text, or holds
+a path into a Mac's home folders (under /Users, or with dashes for slashes, as Claude names its session folders), an
+email address or something that looks like a key, it stops, naming the file and line, and TARGET_DIR is left as it was.
+So does a file on the list that's a link, since what it points to would be published. The only addresses allowed are
+GitHub's users.noreply.github.com ones and those at the names reserved for examples (example.com, .test and the like),
+which can't be anyone's.
 
 Otherwise TARGET_DIR ends up with exactly those files plus a .gitignore: files there that are no longer on the list are
 deleted, and only .git is left alone. So that a typo can't empty some other folder, TARGET_DIR must be new, empty or a
@@ -45,6 +47,7 @@ GITIGNORE = "data/\n.env\n.venv/\n__pycache__/\n*.pyc\n_site/\nstate/\n"
 
 # The patterns are written so that they don't match this file, which is published too.
 USERS_PATH = re.compile(r"/Users(?=/)\S*")
+FLAT_USERS_PATH = re.compile(r"-Users-[A-Za-z0-9._]+-")  # The same path with dashes, as in a Claude session folder.
 EMAIL = re.compile(r"[\w.%+-]+@([\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,})")
 # GitHub's no-reply addresses, and the names reserved for examples and tests (RFC 2606).
 ALLOWED_DOMAINS = ("users.noreply.github.com", "example.com", "example.net", "example.org")
@@ -66,11 +69,18 @@ class NotPublished(Exception):
 
 
 def whitelisted(root: Path, patterns=WHITELIST) -> list[str]:
-    """The files to publish, relative to root. A pattern that matches nothing is a problem: the copy would be broken."""
+    """The files to publish, relative to root. A pattern that matches nothing is a problem: the copy would be broken.
+    So is a link, or a file reached through one: what it points to, which could be outside the project, would be
+    published in its place."""
     files, problems = set(), []
+    real_root = root.resolve()
     for pattern in patterns:
-        found = {path.relative_to(root).as_posix() for path in root.glob(pattern) if path.is_file()}
-        if not found:
+        matched = list(root.glob(pattern))
+        links = [path for path in matched if path.is_symlink() or not path.resolve().is_relative_to(real_root)]
+        problems += [f"{path.relative_to(root).as_posix()} is a link, or inside one, so what it points to would be "
+                     f"published" for path in links]
+        found = {path.relative_to(root).as_posix() for path in matched if path.is_file() and path not in links}
+        if not found and not links:
             problems.append(f"nothing in {root.name} matches {pattern}")
         files |= found
     if problems:
@@ -86,9 +96,16 @@ def scan(folder: Path) -> list[str]:
         if path.name == ".env":
             problems.append(f"{name}: a .env file, which holds keys")
             continue
-        for number, line in enumerate(path.read_bytes().decode("utf-8", errors="replace").splitlines(), 1):
+        try:
+            text = path.read_bytes().decode("utf-8")
+        except UnicodeDecodeError as error:  # UTF-16, say, would hide an address from every check below.
+            problems.append(f"{name}: not UTF-8 text ({error.reason} at byte {error.start}), so it couldn't be checked")
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
             for match in USERS_PATH.finditer(line):
                 problems.append(f"{name}:{number}: a path on this Mac, {match.group()}")
+            for match in FLAT_USERS_PATH.finditer(line):
+                problems.append(f"{name}:{number}: a path on this Mac, written with dashes, {match.group()}")
             for match in EMAIL.finditer(line):
                 domain = match.group(1).lower()
                 if domain not in ALLOWED_DOMAINS and not domain.endswith(RESERVED_ENDINGS):
@@ -169,8 +186,8 @@ def main(argv=None) -> None:
         files, removed = publish(ROOT, Path(args.target))
     except NotPublished as error:
         sys.exit("Not published. Nothing in the target folder was changed:\n- " + "\n- ".join(error.problems))
-    print(f"Copied {len(files)} files into {args.target}, and checked them: no .env file, no path into a home folder, "
-          f"no one's email address and nothing that looks like a key.")
+    print(f"Copied {len(files)} files into {args.target}, and checked them: no links, all UTF-8 text, no .env file, "
+          f"no path under /Users (with slashes or dashes), no one's email address and nothing that looks like a key.")
     if removed:
         print(f"Deleted {len(removed)} that are no longer published: {', '.join(removed)}")
     print("Nothing was committed. Look it over with git status there, then commit and push it yourself.")

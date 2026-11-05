@@ -157,6 +157,7 @@ ADDED_COLUMNS = (
     ("fills", "liquidity", "TEXT"),
     ("stops", "target_price", "TEXT"),
     ("sessions", "kind", "TEXT NOT NULL DEFAULT 'decision'"),
+    ("sys_children", "priced_at", "REAL"),  # systematic.SCHEMA's.
 )
 
 
@@ -168,7 +169,7 @@ class DB:
         self.conn.executescript(SCHEMA)
         for table, column, kind in ADDED_COLUMNS:
             existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
-            if column not in existing:
+            if existing and column not in existing:  # A table not made yet gets the column when it's made.
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     @property

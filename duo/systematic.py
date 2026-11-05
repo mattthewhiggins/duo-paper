@@ -54,6 +54,7 @@ from .sys_research import RUNBOOK, Strategy, StrategyRefused
 DAY = 86400
 CLOSES_LOGGED = 300
 CARRY_BARS = 3
+FLATTEN_NOTE = "flatten at market, capped"  # A kill-switch order's own note, which it keeps once placed.
 LIVE_REFUSAL = (
     "The systematic runner is paper only, and live mode is refused. Live trading needs exchange-side stops and a "
     f"restart path that holds up (audit findings 34 and 48) and your explicit approval: see {RUNBOOK}."
@@ -118,7 +119,8 @@ CREATE TABLE IF NOT EXISTS sys_children (
     fill_price TEXT, fill_fee TEXT,
     fill_bid TEXT, fill_ask TEXT,       -- the quote it filled on, or for a path fill the low and high of its candle
     checks TEXT,                        -- the gate's checks on this order
-    note TEXT
+    note TEXT,
+    priced_at REAL                      -- a resting child's: when the quote it was priced from was fetched
 );
 CREATE TABLE IF NOT EXISTS sys_heartbeats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -544,18 +546,22 @@ class SystematicRunner:
         if self.config.quote != "USD":
             return None  # Binance's closes are in USDT. A GBP book would need a rate this doesn't have.
         value, closes = book.cash, {}
+        # Binance answering clears its count of errors in a row, as in check_signal and decide: after the day's decision
+        # this is the only call to Binance, so otherwise a count run up here would block every order until the next day.
         try:
             for asset, qty in sorted(book.held.items()):
                 symbol = f"{self._column_of(asset).split('~', 1)[0]}USDT"
                 rows = sys_data.parse_klines(self.binance.klines(symbol, 3), now)
                 row = next((r for r in rows if r[0] == day - DAY), None)
                 if row is None:
+                    self.api_result("binance", True)  # It answered, without that bar yet.
                     return None
                 closes[asset] = row[4]
                 value += qty * D(repr(row[4]))
         except sys_data.DataError as error:
             self.api_result("binance", False, str(error))
             return None
+        self.api_result("binance", True)
         return {"day": day, "equity": str(value), "closes": closes,
                 "how": f"no loop ran in the 15 minutes before 00:00 UTC, so the holdings are valued at Binance's "
                        f"closes of the bar that ended then (first loop {late:.0f} minutes after 00:00 UTC)"}
@@ -612,9 +618,9 @@ class SystematicRunner:
             self.db.execute(
                 "INSERT INTO sys_orders(decision_id, source, asset, side, qty_wanted, target_weight, weight_before, "
                 "target_change, created_at, status, note) VALUES(?, 'kill_switch', ?, 'sell', ?, '0', ?, ?, ?, "
-                "'working', 'flatten at market, capped')",
+                "'working', ?)",
                 (latest["id"] if latest else None, asset, str(qty), None if weight is None else str(weight),
-                 None if weight is None else str(weight), now))
+                 None if weight is None else str(weight), now, FLATTEN_NOTE))
 
     def resume(self, now: float | None = None) -> bool:
         """Clears the kill switch. The peak resets to current equity, or the old peak would trip it again at once."""
@@ -993,7 +999,9 @@ class SystematicRunner:
             reprice = now - open_child["placed_at"] >= self.s.reprice_minutes * 60 - slack
             if not (taker or reprice):
                 return
-            if not self._cancel_child(open_child, now, "re-priced" if not taker else "moved to taker"):
+            # In a scheduled run that can't read its candles, the child stays open: the next run judges its whole life.
+            if not self._cancel_child(open_child, now, "re-priced" if not taker else "moved to taker",
+                                      defer_unjudged=True):
                 return
             order = self.db.one("SELECT * FROM sys_orders WHERE id = ?", (order["id"],))
             if order["status"] != "working":
@@ -1033,6 +1041,10 @@ class SystematicRunner:
             room = (book.cash - book.open_buy_cash) / (1 + rate)
             notional = min(notional_left, room)
             qty = notional / limit if limit > 0 else Decimal(0)
+            if kind == "taker" and limit > 0:
+                # Sized at the ask, which it fills near, so one fill completes the order (sized at its cap, it filled
+                # about 0.45% short and the rest waited a run). The cash it could need is still counted at the cap.
+                qty = min(notional_left / quote.ask, room / limit)
             limit_share = book.asset_limit.get(asset)
             if finite(book.equity) and finite(limit_share) and book.marks.get(asset):
                 ceiling = (limit_share * book.equity / book.marks[asset] - book.held.get(asset, Decimal(0))
@@ -1061,12 +1073,18 @@ class SystematicRunner:
                  result.error))
             self._note(order, f"blocked: {result.error}")
             return
+        own = FLATTEN_NOTE if order["source"] == "kill_switch" else None
+        if order["note"] != own:  # Placed, so a block or a wait noted earlier is over. Its blocked child keeps it.
+            self.db.execute("UPDATE sys_orders SET note = ? WHERE id = ?", (own, order["id"]))
         if kind == "maker":
+            # placed_at is the run's clock, which the re-price and life timers count from. priced_at is when its quote
+            # was fetched, which can be minutes later: the path window starts after that, so it never takes in trades
+            # from before the price existed.
             self.db.execute(
                 "INSERT INTO sys_children(order_id, venue_id, kind, asset, side, qty, limit_price, bid, ask, placed_at, "
-                "status, checks) VALUES(?, ?, 'maker', ?, ?, ?, ?, ?, ?, ?, 'open', ?)",
-                (order["id"], result.venue_id, asset, side, str(qty), str(limit), str(quote.bid), str(quote.ask), now,
-                 checks))
+                "priced_at, status, checks) VALUES(?, ?, 'maker', ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)",
+                (order["id"], result.venue_id, asset, side, str(qty), str(limit), str(quote.bid), str(quote.ask),
+                 now, float(quote.ts), checks))
             return
         if result.fill is None:
             self.db.execute(
@@ -1097,7 +1115,7 @@ class SystematicRunner:
                 continue
             why = "nobody managed it"
             if self.scheduled:
-                filled, why = self._fill_on_path(child, now)
+                filled, why, _ = self._fill_on_path(child, now)
                 if filled:
                     continue
             if now - child["placed_at"] > self.gate.ttl_seconds:
@@ -1113,16 +1131,20 @@ class SystematicRunner:
             if status is not None and status.done and status.qty > 0:
                 self._book_fill(child, status.qty, status.gross, status.fee, "maker", quote, now)
 
-    def _cancel_child(self, child, now: float, why: str) -> bool:
-        """Cancels a resting child, booking a fill if the cancel found one. False if it couldn't be confirmed."""
+    def _cancel_child(self, child, now: float, why: str, defer_unjudged: bool = False) -> bool:
+        """Cancels a resting child, booking a fill if the cancel found one. False if it couldn't be confirmed, or with
+        defer_unjudged if a scheduled run couldn't read Kraken's 1-minute candles while the child has life left: it then
+        stays open, so the fill it may have had since the last run isn't lost to the cancel."""
         if child["kind"] != "maker":  # A taker is never resting: it filled when placed or it didn't.
             self.db.execute("UPDATE sys_children SET status = 'unfilled', closed_at = ?, note = ? WHERE id = ?",
                             (now, f"{why}; a taker left open never filled", child["id"]))
             return True
         if self.scheduled:  # A fill that already happened on the path since the last run is booked, not cancelled away.
-            filled, why_not = self._fill_on_path(child, now)
+            filled, why_not, read = self._fill_on_path(child, now)
             if filled:
                 return True
+            if defer_unjudged and not read and now - child["placed_at"] <= self.gate.ttl_seconds:
+                return False
             why = f"{why}; {why_not}"
         if now - child["placed_at"] > self.gate.ttl_seconds:
             self._expire_child(child, now, why)
@@ -1158,34 +1180,38 @@ class SystematicRunner:
             self.db.execute("UPDATE sys_children SET status = 'missed', closed_at = ?, note = ? WHERE id = ?",
                             (now, f"closed unfilled: {why}", child["id"]))
 
-    def _fill_on_path(self, child, now: float) -> tuple[bool, str]:
+    def _fill_on_path(self, child, now: float) -> tuple[bool, str, bool]:
         """A scheduled run's fill check for a resting paper child: Kraken's 1-minute candles over its life so far. Books
-        the fill if there is one. Returns (filled, why not), for the note of a child that closes unfilled.
+        the fill if there is one. Returns (filled, why not, whether the candles could be read), the why not for the note
+        of a child that closes unfilled.
 
         No poll watched the book since the last run, 15 to 60 minutes ago, so the price path stands in for those polls.
-        The window is every candle that starts from the whole minute after the child was placed (the minute it was
-        placed in holds trades from before it) and before the end of its life or now, whichever comes first.
+        The window is every candle that starts from the whole minute after the child was placed and its quote fetched
+        (the minute either fell in holds trades from before its price) and before the end of its life or now, whichever
+        comes first.
         PaperBroker's rule decides, through the gate like every fill check: a buy fills on the first candle whose low is
         the trade-through below its limit, a sell on the first whose high is that far above, in full, at the limit, at
         the maker fee. It's booked at that candle's start. A candle with no volume had no trades to fill against.
 
         Missing candles never make a fill. If they can't be read, or a minute is missing between the start of the window
-        and the candle that would fill it, nothing is booked: the child stays open while it has life left, and once past
-        its life it closes unfilled, which can only be pessimistic.
+        and the candle that would fill it, nothing is booked. A child whose candles couldn't be read stays open while it
+        has life left, even in a run that would re-price it or switch to taker (_cancel_child's defer_unjudged), so the
+        next run judges its whole life; one with a minute missing is re-priced as usual. Once past its life it closes
+        unfilled, which can only be pessimistic.
         """
-        start = math.ceil(child["placed_at"] / 60) * 60
+        start = math.ceil(max(child["placed_at"], child["priced_at"] or 0) / 60) * 60
         end = min(now, child["placed_at"] + self.gate.ttl_seconds)
         if start >= end:
-            return False, "not a whole minute on the book yet"
+            return False, "not a whole minute on the book yet", True
         try:
             candles = self.market.minute_candles(child["asset"])
         except Exception as error:  # Whatever went wrong, there's no path to judge it on.
-            return False, f"Kraken's 1-minute candles couldn't be read ({error})"
+            return False, f"Kraken's 1-minute candles couldn't be read ({error})", False
         order = {"side": child["side"], "limit_price": child["limit_price"], "qty": child["qty"]}
         expected = start
         for candle in sorted((c for c in candles if start <= c.ts < end), key=lambda c: c.ts):
             if candle.ts != expected:
-                return False, f"Kraken's 1-minute candles are missing the one from {hhmm(expected)} UTC"
+                return False, f"Kraken's 1-minute candles are missing the one from {hhmm(expected)} UTC", True
             expected += 60
             if not candle.volume > 0:
                 continue
@@ -1199,10 +1225,10 @@ class SystematicRunner:
                                 at=float(candle.ts),
                                 note=f"filled on Kraken's 1-minute candle starting {hhmm(candle.ts)} UTC, low {low} "
                                      f"and high {high}, which fill_bid and fill_ask hold")
-                return True, ""
+                return True, "", True
         if expected < end:
-            return False, f"Kraken's 1-minute candles have nothing from {hhmm(expected)} UTC"
-        return False, "no trade through its limit on Kraken's 1-minute candles"
+            return False, f"Kraken's 1-minute candles have nothing from {hhmm(expected)} UTC", True
+        return False, "no trade through its limit on Kraken's 1-minute candles", True
 
     def _book_fill(self, child, qty: Decimal, gross: Decimal, fee: Decimal, liquidity: str, quote, now: float,
                    new_child: tuple | None = None, at: float | None = None, note: str | None = None) -> None:

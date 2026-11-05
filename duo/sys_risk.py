@@ -28,7 +28,10 @@ from .config import SystematicConfig
 from .market import Quote
 from .risk import RESTING, IMMEDIATE, Ticket
 
-FUTURE_TOLERANCE_SECONDS = 60
+# How long after the loop's clock a quote may be stamped and still be fresh. A tick fixes its now when it starts, and
+# its own calls (retries, timeouts, decide's second refresh) can take minutes. The workflow's Tick step stops a tick
+# before 300 s, so a quote stamped later than that is a clock problem.
+FUTURE_TOLERANCE_SECONDS = 300
 CONTROLS = ("kill_switch","daily_loss", "stale_data", "quote_fresh", "asset_limit", "gross_exposure", "order_cap")
 
 
@@ -197,8 +200,8 @@ class Controls:
         if frozen > self.c.max_frozen_quote_seconds:
             return Check("quote_fresh", age, limit, False,
                          f"quote unchanged for {frozen:.0f}s, over {self.c.max_frozen_quote_seconds}s: frozen feed?")
-        # A quote fetched during this loop is stamped a moment after the loop's own clock, so its age is slightly
-        # negative. That's fresh. One from well in the future means a clock problem, which fails.
+        # A quote fetched during this loop is stamped after the loop's own clock, so its age is a little negative (up to
+        # minutes in a scheduled run). That's fresh. One from well in the future means a clock problem, which fails.
         fresh = -FUTURE_TOLERANCE_SECONDS <= age <= limit
         return Check("quote_fresh", max(age, 0.0), limit, fresh,
                      f"quote {max(age, 0.0):.0f}s old" if age >= -FUTURE_TOLERANCE_SECONDS

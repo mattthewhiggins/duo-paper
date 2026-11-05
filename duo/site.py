@@ -41,10 +41,10 @@ from .sys_risk import finite
 from .systematic import DAY, day_start, export_decisions
 
 PAGE = Path(__file__).parent / "static" / "site.html"
-TARGET_DAYS = 28                # The length of run the owner set out to watch.
-STALE_MINUTES = 150             # The page calls itself stale past this: an hourly slot, an hour of GitHub's delay and
-                                # a skipped run.
-MAX_CHART_POINTS = 500
+TARGET_DAYS = 28                # The finished days compared the owner set out to watch (RUNBOOK section 1).
+STALE_MINUTES = 195             # The page calls itself stale past this: an hourly slot, a skipped run and an hour of
+                                # GitHub's delay (180, the runner's cron_gap_minutes), plus the build and the deploy.
+MAX_CHART_POINTS = 500          # Past this, every Nth run is drawn, and each day's last.
 RECENT_DECISIONS = 10
 RECENT_ORDERS = 10
 RECENT_FILLS = 30
@@ -71,7 +71,8 @@ CONTROLS = {
 }
 NOTES = {
     "paper": "Paper money only. Orders are simulated against real public prices: no money is at risk, no exchange "
-             "account or key is used, and nothing here can place a real order. Not financial advice.",
+             "account or key is used, and nothing here can place a real order. Not financial advice, and not a "
+             "recommendation to buy, sell or hold anything.",
     "holdout": "This strategy did not pass the research's holdout gate: its Sharpe ratio on the held-out years fell "
                "below half its Sharpe ratio on the development years. This run is to watch how it behaves on live "
                "prices, not proof that it works.",
@@ -98,7 +99,10 @@ class ReadOnlyDB:
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self.conn = sqlite3.connect(f"{self.path.resolve().as_uri()}?mode=ro", uri=True, timeout=30,
+        # A WAL database opens read-only only beside its -wal and -shm files. Without them, as it's saved on
+        # paper-state, everything is in the main file, and immutable reads it as it is, creating neither.
+        mode = "?mode=ro" if Path(f"{self.path}-wal").exists() else "?mode=ro&immutable=1"
+        self.conn = sqlite3.connect(f"{self.path.resolve().as_uri()}{mode}", uri=True, timeout=30,
                                     isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.tables = {row["name"] for row in self.all("SELECT name FROM sqlite_master WHERE type = 'table'")}
@@ -240,8 +244,8 @@ def plain_reason(reason: str, daily_loss_pct=8) -> str:
     if text == "daily loss limit: no buys today":
         return f"Down {daily_loss_pct}% or more since 00:00 UTC, so no buys until tomorrow. Sells still run."
     if text == "daily loss unknown: no buys":
-        return ("Today's loss can't be measured yet (there's no usable price for the start of the day), so no buys for "
-                "now. Sells still run.")
+        return ("Today's loss can't be measured right now (no usable Kraken price for the holdings, or none for the "
+                "start of the day), so no buys for now. Sells still run.")
     if text == "daily bar missing: no new orders":
         return "Yesterday's daily bar hasn't arrived from Binance yet, so no new orders until it does."
     if text == "equity unknown: no new orders":
@@ -281,7 +285,9 @@ def _start(config: Config, start: dict, now: float) -> dict:
     quote = start.get("quote", "USD")
     capital, rate = D(start["starting_capital"]), D(start.get("gbp_usd") or 1)
     started = float(start["started_at"])
-    ends = day_start(started) + TARGET_DAYS * DAY  # Day 1 is the start's UTC day, and day 28 ends at its midnight.
+    # Day 1 is the start's UTC day. Day 28 is the 28th finished day once the next day's decision compares it: at the
+    # first run after this, or later if a day had no decision.
+    ends = day_start(started) + TARGET_DAYS * DAY + _setting(config, "settle_minutes") * 60
     return {
         **_at("at", started), "date": _date(started), "quote": quote,
         "capital_gbp": D(start["starting_capital_gbp"]), "capital": capital,
@@ -290,7 +296,7 @@ def _start(config: Config, start: dict, now: float) -> dict:
         "maker_pct": D(start["maker_pct"]), "taker_pct": D(start["taker_pct"]),
         "trade_through_pct": config.paper_trade_through_pct,
         "day": max(1, (day_start(now) - day_start(started)) // DAY + 1), "target_days": TARGET_DAYS,
-        **_at("ends_at", ends), "complete": now >= ends,
+        **_at("ends_at", ends), "days_compared": None, "complete": False,  # build() sets both, from compare.
     }
 
 
@@ -463,9 +469,9 @@ def _chart(ro: ReadOnlyDB, start: dict, valuation: dict) -> dict:
         if "sys_heartbeats" in ro.tables else []
     beats = [(ts, equity) for ts, equity in beats if equity is not None]
     step = max(1, math.ceil(len(beats) / MAX_CHART_POINTS))
-    kept = beats[::step]
-    if beats and kept[-1] is not beats[-1]:
-        kept.append(beats[-1])
+    # Every step-th run, and each UTC day's last (the latest is one), so the page's by-day table has each day's close.
+    lasts = {day_start(ts): i for i, (ts, _) in enumerate(beats)}
+    kept = [beats[i] for i in sorted(set(range(0, len(beats), step)) | set(lasts.values()))]
     snaps = ro.all("SELECT ts, benchmark FROM snapshots ORDER BY ts") \
         if valuation["benchmark_qty"] and "snapshots" in ro.tables else []
     times = [s["ts"] for s in snaps]
@@ -496,10 +502,15 @@ def _today(config: Config, ro: ReadOnlyDB, now: float) -> dict:
     last = ro.one("SELECT day_ts FROM sys_decisions ORDER BY day_ts DESC LIMIT 1") \
         if "sys_decisions" in ro.tables else None
     decided = last is not None and last["day_ts"] >= day - DAY
-    late_from = day + _setting(config, "signal_stale_minutes") * 60
-    overdue = (now - late_from) / 60 if not decided and now > late_from and ro.get("sys_kill") != "1" else None
-    return {"bar_date": _date(day - DAY), **_at("bar_at", day - DAY), "decided": decided,
-            **_at("due_from", settle + DAY if decided else settle), "overdue_minutes": overdue}
+    halted = ro.get("sys_kill") == "1"  # No decision is made while the kill switch is on, until it's resumed.
+    # Overdue from when the heartbeat counts it for a scheduled run (python -m duo tick), as the runs that build this
+    # page are, so the page and the watchdog agree.
+    grace = max(_setting(config, "signal_stale_minutes"), _setting(config, "cron_decision_grace_minutes"))
+    late_from = day + grace * 60
+    overdue = (now - late_from) / 60 if not decided and not halted and now > late_from else None
+    return {"bar_date": _date(day - DAY), **_at("bar_at", day - DAY), "decided": decided, "halted": halted,
+            **_at("due_from", None if halted else settle + DAY if decided else settle),
+            **_at("overdue_from", late_from), "overdue_minutes": overdue}
 
 
 def _order(config: Config, ro: ReadOnlyDB, row, quote: str) -> dict:
@@ -656,9 +667,12 @@ def _fill_totals(ro: ReadOnlyDB, start: dict) -> dict:
 
 
 def _runs(ro: ReadOnlyDB, start: dict, now: float) -> dict:
-    """Each scheduled run is one poll and writes one heartbeat, so heartbeats count the runs."""
-    count = lambda since: ro.one("SELECT COUNT(*) AS n FROM sys_heartbeats WHERE ts > ? AND ts <= ?",
-                                 (since, now))["n"]
+    """Each run is one poll and writes one heartbeat, so heartbeats count the runs. Over a window they're counted from
+    the same time as its scheduled slots: strictly after the start, whose own run isn't one of them."""
+    started = float(start["started_at"])
+    since = lambda span: max(now - span, started)
+    count = lambda after: ro.one("SELECT COUNT(*) AS n FROM sys_heartbeats WHERE ts > ? AND ts <= ?",
+                                 (after, now))["n"]
     last = ro.one("SELECT ts, status FROM sys_heartbeats ORDER BY ts DESC LIMIT 1")
     first = ro.one("SELECT MIN(ts) AS ts, COUNT(*) AS n FROM sys_heartbeats")
     recent = [r["ts"] for r in ro.all("SELECT ts FROM sys_heartbeats WHERE ts > ? AND ts <= ? ORDER BY ts",
@@ -666,13 +680,12 @@ def _runs(ro: ReadOnlyDB, start: dict, now: float) -> dict:
     before = ro.one("SELECT ts FROM sys_heartbeats WHERE ts <= ? ORDER BY ts DESC LIMIT 1", (now - DAY,))
     times = ([before["ts"]] if before else []) + recent
     gaps = [b - a for a, b in zip(times, times[1:])]
-    started = float(start["started_at"])
     slots = schedule_slots()
     return {
         **_at("last_at", last["ts"] if last else None), "last_status": last["status"] if last else None,
         **_at("first_at", first["ts"]), "total": first["n"],
-        "last_24h": count(now - DAY), "scheduled_24h": scheduled_between(max(now - DAY, started), now),
-        "last_7d": count(now - 7 * DAY), "scheduled_7d": scheduled_between(max(now - 7 * DAY, started), now),
+        "last_24h": count(since(DAY)), "scheduled_24h": scheduled_between(since(DAY), now),
+        "last_7d": count(since(7 * DAY)), "scheduled_7d": scheduled_between(since(7 * DAY), now),
         "longest_gap_24h_minutes": max(gaps) / 60 if gaps else None,
         "scheduled_longest_gap_minutes": max((b - a for a, b in zip(slots, slots[1:] + [slots[0] + 1440])),
                                              default=None),
@@ -723,7 +736,8 @@ def gather(config: Config, ro: ReadOnlyDB, now: float) -> dict:
     """Everything status.json holds except the files written beside it."""
     start = _loads(ro.get("sys_start"))
     status = {
-        "schema": 1, "title": "Duo paper run", **_at("generated_at", now), "mode": config.mode,
+        "schema": 1, "title": "Duo paper run", **_at("generated_at", now), **_at("tick_at", ro.get("sys_tick_at")),
+        "mode": config.mode,
         "stale_after_minutes": STALE_MINUTES, "target_days": TARGET_DAYS,
         "strategy": None, "start": None, "heartbeat": None, "today": None, "holdings": None, "equity": None,
         "hold_btc": None, "chart": None, "decisions": [], "orders": [], "fills": [], "fill_totals": None,
@@ -775,6 +789,9 @@ def build(config: Config, db: DB | ReadOnlyDB, out_dir: Path, now: float | None 
         if isinstance(_loads(ro.get("sys_start")), dict):
             status["compare"], report = _compare(ro)
             decisions, decisions_error = _decisions_export(ro)
+            if status["start"]:  # The 28 days are finished days compared, as RUNBOOK section 1 counts them.
+                days = status["compare"]["summary"].get("days")
+                status["start"].update(days_compared=days, complete=(days or 0) >= TARGET_DAYS)
         else:
             status["compare"] = {"ok": False, "error": None, "summary": {}, "notes": ["No paper run yet."], "days": []}
     finally:

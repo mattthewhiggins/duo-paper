@@ -24,18 +24,21 @@ on:
         options: [tick, start, resume, flatten, probe]
         default: tick
 
-# One run at a time, and none cancelled halfway: two at once would each restore the same state, and the later save
-# would lose the earlier one's fills (save_state.sh's lease refuses that anyway).
+# One run at a time, and none cancelled, halfway or while it waits: two at once would each restore the same state, and
+# the later save would lose the earlier one's fills (save_state.sh's lease refuses that anyway). queue: max keeps every
+# waiting run, in order. Without it GitHub cancels a waiting run (a start or flatten, say) when another one queues.
+# GitHub refuses queue: max with cancel-in-progress: true.
 concurrency:
   group: paper-run
   cancel-in-progress: false
+  queue: max
 
 permissions: {}  # Each job asks for only what it needs.
 
 jobs:
   run:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15  # Room for the Tick step's 8 and the save after it.
     permissions:
       contents: write  # To push the paper-state branch. Nothing else is ever pushed.
     env:
@@ -65,12 +68,19 @@ jobs:
         if: env.ACTION != 'probe'
         run: bash ops/actions/restore_state.sh state "$ACTION"
 
+      # A hung request mustn't take the whole job, so the state is still saved. The step's timeout-minutes can't stop
+      # python: it signals only the step's bash, and python would carry on writing while the state is saved. So each
+      # python goes through coreutils' timeout, which runs the real one: SIGINT at 270 s stops the tick with its
+      # database closed, and SIGKILL follows 20 s later if it's still going. Either fails the step (exit 124 or 137).
+      # --foreground sends the SIGINT to python alone, so it comes once: a second one could cut the closing short.
+      # timeout-minutes is only an outer guard, with room for resume and tick, which are two calls.
       - name: Tick
         id: tick
         if: steps.state.outputs.started == 'true'
-        timeout-minutes: 5  # A hung request mustn't take the whole job, so the state is still saved.
+        timeout-minutes: 8
         run: |
           set +e
+          python() { timeout --foreground --signal=INT --kill-after=20s 270s python "$@"; }
           case "$ACTION" in
             tick) python -m duo tick ;;
             start) python -m duo tick --first-run ;;
@@ -86,7 +96,8 @@ jobs:
           exit "$code"
 
       # Whatever the tick did is kept, even if it failed partway, as the laptop's database would keep it. The one
-      # exception is a start that failed: it leaves nothing behind, so a broken first run can't become the paper run.
+      # exception is a failed start of a new paper run (restore_state.sh's new, on a new branch or one whose database
+      # is gone): it leaves nothing behind, so a broken first run can't become the paper run.
       - name: Decide what to keep
         id: keep
         if: always() && steps.state.outputs.started == 'true'
@@ -101,10 +112,20 @@ jobs:
               "with action start again."
           fi
 
+      # A new run's start that isn't saved leaves paper-state without a paper run, and later runs only say there's
+      # none, so this says what to do.
       - name: Save the paper state
         id: save
         if: always() && steps.keep.outputs.state == 'true'
-        run: bash ops/actions/save_state.sh state
+        env:
+          NEW: ${{ steps.state.outputs.new }}
+        run: |
+          bash ops/actions/save_state.sh state && exit 0
+          if [ "$NEW" = true ]; then
+            echo "::error::The start wasn't saved, so the paper run hasn't begun. Run the workflow with action start" \
+              "again."
+          fi
+          exit 1
 
       # Only a saved state is published, so the page never shows what the next run won't carry on from.
       - name: Build the status page

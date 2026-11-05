@@ -7,7 +7,7 @@
 # keeps one commit per UTC day, a daily snapshot: a save on the same UTC day as the last commit amends that commit, and
 # the first save of a new day adds one. When nothing has changed, nothing is committed.
 #
-# DUO_STATE_TODAY (YYYY-MM-DD) stands in for today's UTC date. It's for the tests only.
+# DUO_STATE_TODAY (YYYY-MM-DD) stands in for today's UTC date, and DUO_STATE_PROC for /proc. They're for the tests only.
 set -euo pipefail
 
 dir=${1:?usage: save_state.sh DIR}
@@ -21,10 +21,14 @@ if [ "$(git -C "$dir" symbolic-ref -q HEAD || true)" != "refs/heads/$branch" ]; 
 fi
 
 # The database runs in WAL mode, so its latest writes can still be in the -wal file. Fold them into the database file
-# so that file holds everything. If something still has it open, it may be half-written, so don't save it.
+# so that file holds everything. If something is still using it, it may be half-written, so don't save it. The
+# checkpoint only says busy when something has held a lock on it for over 5 s (sqlite3's default timeout), not when
+# another process merely has it open, as a tick still running would. So that's looked for too.
 for db in "$dir"/data/*.db; do
   [ -f "$db" ] || continue
   python3 - "$db" <<'PY'
+import glob
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -34,7 +38,21 @@ connection = sqlite3.connect(path)
 busy = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
 connection.close()
 if busy:
-    sys.exit(f"{path} is still open somewhere, so it may be half-written. Not saving it.")
+    sys.exit(f"{path} is still in use somewhere, so it may be half-written. Not saving it.")
+# Linux lists each process's open files as links in /proc/PID/fd. Elsewhere (macOS) there's no /proc, and nothing is
+# found: the workflow runs on Linux.
+names = {os.path.realpath(path), os.path.realpath(path + "-wal")}
+holders = set()
+for link in glob.glob(os.environ.get("DUO_STATE_PROC", "/proc") + "/[0-9]*/fd/*"):
+    pid = link.split("/")[-3]
+    try:
+        if pid != str(os.getpid()) and os.readlink(link) in names:
+            holders.add(pid)
+    except OSError:
+        pass  # That process, or that file of it, has closed since.
+if holders:
+    sys.exit(f"{path} is still open in process {', '.join(sorted(holders, key=int))}, so it may be half-written. "
+             f"Not saving it.")
 # Everything is in the database file now. Some SQLite builds (macOS's) keep an empty -wal and the -shm index after the
 # last close; others delete them. Delete them here, so the saved state is the same whichever machine saved it.
 wal = Path(path + "-wal")

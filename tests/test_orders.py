@@ -407,6 +407,18 @@ class Migration(unittest.TestCase):
         self.assertIn("liquidity", {r["name"] for r in db.all("PRAGMA table_info(fills)")})
         self.assertIn("target_price", {r["name"] for r in db.all("PRAGMA table_info(stops)")})
 
+    def test_a_systematic_database_from_before_this_version_gets_priced_at(self):
+        import sqlite3, tempfile
+        from pathlib import Path
+        from duo.db import DB
+        path = Path(tempfile.mkdtemp()) / "old.db"
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE sys_children (id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL, venue_id TEXT, kind TEXT NOT NULL, asset TEXT NOT NULL, side TEXT NOT NULL, qty TEXT NOT NULL, limit_price TEXT NOT NULL, bid TEXT, ask TEXT, placed_at REAL NOT NULL, closed_at REAL, status TEXT NOT NULL, fill_price TEXT, fill_fee TEXT, fill_bid TEXT, fill_ask TEXT, checks TEXT, note TEXT)")
+        conn.commit(); conn.close()
+        self.assertIn("priced_at", {r["name"] for r in DB(path).all("PRAGMA table_info(sys_children)")})
+        fresh = DB(Path(tempfile.mkdtemp()) / "new.db")  # The systematic runner makes the table itself, later.
+        self.assertEqual(fresh.all("PRAGMA table_info(sys_children)"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

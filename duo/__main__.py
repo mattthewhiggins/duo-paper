@@ -172,6 +172,7 @@ def _tick(config: Config, db: DB, market, binance, now: float, flatten: bool) ->
 
     failure, since = None, None  # since: the newest heartbeat and fill from before this run, once it's got that far.
     try:
+        db.set("sys_tick_at", now)  # The status page tells a tick that wrote no heartbeat by this.
         effective, strategy, start = prepare(config, db, market, now=now)
         market.quote = effective.quote
         broker = PaperBroker(effective)
@@ -309,12 +310,18 @@ def build_site(config: Config, out: Path) -> dict:
         close_db(db)
 
 
-def systematic_db(config: Config) -> DB:
+def systematic_db(config: Config, command: str | None = None) -> DB:
     if not config.systematic_on:
         sys.exit("The systematic runner is off in config.toml ([systematic] enabled = false).")
     if not config.db_path.exists():
-        sys.exit(f"No systematic paper run yet: {config.db_path} doesn't exist. Start one with ./start.sh, or on "
-                 f"GitHub Actions by running the Paper run workflow with action start.")
+        # A copy of the GitHub run's database is only for reading: resuming one changes the copy, not the run.
+        mac = ("On the Mac, this can't reach the GitHub run: resume that with the Paper run workflow's action resume "
+               "(RUNBOOK 12.5)." if command == "resume" else
+               "On the Mac, copy the GitHub run's database out first (RUNBOOK 12.7), or start a local run with "
+               "./start.sh.")
+        sys.exit(f"No systematic paper run here: {config.db_path} doesn't exist. On GitHub Actions, that means "
+                 f"paper-state has no database: start the run with the Paper run workflow's action start (RUNBOOK "
+                 f"12.3). {mac}")
     return DB(config.db_path)
 
 
@@ -496,7 +503,7 @@ def main() -> None:
         sys.exit(0 if ok else 1)
     elif args.command == "resume":
         from .systematic import resume_in_db
-        print(resume_in_db(systematic_db(config)))
+        print(resume_in_db(systematic_db(config, "resume")))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from .config import D
 from .kraken import KrakenClient
@@ -14,6 +14,18 @@ BENCHMARK_ASSET = "BTC"
 CANDLE_INTERVALS = (15, 60, 240, 1440)  # minutes, the ones the agents can ask for
 MINUTE = 1  # Kraken's 1-minute candles too, which the systematic runner's scheduled runs judge paper fills on
 _KRAKEN_NAMES = {"BTC": "XBT"}
+
+
+def kraken_number(value, what: str) -> Decimal:
+    """A number from a Kraken reply. One that isn't a finite number is a ValueError, which is how the callers count a
+    bad reply: as Kraken failing. decimal's own InvalidOperation isn't a ValueError, so it would get past them all."""
+    try:
+        number = D(value)
+    except InvalidOperation:
+        number = None
+    if number is None or not number.is_finite():
+        raise ValueError(f"Kraken sent {value!r} as {what}, which isn't a number")
+    return number
 
 
 @dataclass(frozen=True)
@@ -80,8 +92,8 @@ class Market:
                     quote_code=info["quote"],
                     lot_decimals=int(info["lot_decimals"]),
                     pair_decimals=int(info["pair_decimals"]),
-                    ordermin=D(info.get("ordermin", 0)),
-                    costmin=D(info.get("costmin", 0)),
+                    ordermin=kraken_number(info.get("ordermin", 0), f"{key}'s ordermin"),
+                    costmin=kraken_number(info.get("costmin", 0), f"{key}'s costmin"),
                     online=info.get("status", "online") == "online",
                 )
         missing = set(self.tracked) - set(pairs)
@@ -100,7 +112,9 @@ class Market:
             for key, ticker in result.items():
                 asset = by_key.get(key)
                 if asset:
-                    quotes[asset] = Quote(asset, D(ticker["b"][0]), D(ticker["a"][0]), D(ticker["c"][0]), now)
+                    quotes[asset] = Quote(asset, kraken_number(ticker["b"][0], f"{key}'s bid"),
+                                          kraken_number(ticker["a"][0], f"{key}'s ask"),
+                                          kraken_number(ticker["c"][0], f"{key}'s last trade"), now)
             self.quotes = quotes
             return quotes
 
@@ -116,7 +130,12 @@ class Market:
         pair = self.pairs[asset]
         result = self.client.public("OHLC", pair=pair.altname, interval=interval)
         rows = result.get(pair.key) or next(v for k, v in result.items() if k != "last")
-        candles = [Candle(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[6])) for r in rows]
+        try:  # A row that isn't numbers is a ValueError, as a bad Ticker number is: a bad reply from Kraken.
+            candles = [Candle(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[6])) for r in rows]
+        except (TypeError, ValueError, IndexError) as error:
+            raise ValueError(f"Kraken's {pair.altname} candles aren't rows of numbers ({error})") from None
+        if not all(math.isfinite(x) for c in candles for x in (c.open, c.high, c.low, c.close, c.volume)):
+            raise ValueError(f"Kraken's {pair.altname} candles hold a price or volume that isn't a number")
         self._candles[cache_key] = (time.time(), candles)
         return candles[-count:]
 

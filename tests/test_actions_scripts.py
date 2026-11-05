@@ -111,9 +111,9 @@ class StateBranch(unittest.TestCase):
         outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
         return clone, outputs, result
 
-    def save(self, clone: Path, at: str) -> subprocess.CompletedProcess:
+    def save(self, clone: Path, at: str, **extra) -> subprocess.CompletedProcess:
         return run(["bash", str(SAVE), "state"], clone, DUO_STATE_TODAY=at[:10], GIT_COMMITTER_DATE=at,
-                   GIT_AUTHOR_DATE=at)
+                   GIT_AUTHOR_DATE=at, **extra)
 
     def started(self, at="2026-11-05T00:20:00Z", label="start") -> Path:
         clone, outputs, result = self.job("start")
@@ -229,6 +229,49 @@ class StateBranch(unittest.TestCase):
         self.assertIn("::warning::paper-state has no data/paper_systematic.db", result.stdout)
         # Nothing is made in its place: the tick's own guard fails the run instead of starting a new paper run.
         self.assertFalse((clone / "state" / "data" / "paper_systematic.db").exists())
+
+    def test_a_start_on_a_branch_that_lost_its_database_is_a_new_paper_run(self):
+        # RUNBOOK 12.5: start begins a new run there. As on a new branch, a start that fails is then not kept.
+        clone, _, _ = self.job("start")
+        (clone / "state" / "data" / "heartbeat_systematic.json").write_text("{}")
+        self.assertEqual(self.save(clone, "2026-11-05T00:20:00Z").returncode, 0)
+        clone, outputs, result = self.job("start")
+        self.assertEqual(outputs, {"started": "true", "new": "true"}, result.stdout + result.stderr)
+        self.assertIn("so this starts a new paper run", result.stdout)
+        self.assertNotIn("::warning::", result.stdout)
+        write_state(clone / "state", "new start")
+        self.assertEqual(self.save(clone, "2026-11-06T00:20:00Z").returncode, 0)
+        self.assertEqual(self.saved_rows(), ["new start"])
+        # Once it holds a paper run, a start carries on with it, so it isn't new.
+        _, outputs, _ = self.job("start")
+        self.assertEqual(outputs, {"started": "true", "new": "false"})
+
+    def test_a_database_another_process_still_has_open_is_not_saved(self):
+        # As a tick still running would: open, but holding no lock, so the checkpoint isn't busy. /proc, which a
+        # folder of links stands in for here, shows it.
+        self.started()
+        clone, _, _ = self.job("tick")
+        write_state(clone / "state", "half done")
+        db = (clone / "state" / "data" / "paper_systematic.db").resolve()
+        tick = sqlite3.connect(db)
+        self.addCleanup(tick.close)
+        tick.execute("SELECT COUNT(*) FROM ticks").fetchall()
+        proc = self.tmp / "proc"
+        for pid, fd, name in (("4242", "3", db), ("4242", "4", f"{db}-wal"), ("77", "0", os.devnull)):
+            (proc / pid / "fd").mkdir(parents=True, exist_ok=True)
+            (proc / pid / "fd" / fd).symlink_to(name)
+        before = self.tip("paper-state")
+        result = self.save(clone, "2026-11-05T00:35:00Z", DUO_STATE_PROC=str(proc))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is still open in process 4242, so it may be half-written. Not saving it.", result.stderr)
+        self.assertEqual(self.tip("paper-state"), before)
+        self.assertTrue(Path(f"{db}-wal").exists(), "the -wal it still has open is left alone")
+        # Once that process has closed it, it's saved.
+        tick.close()
+        shutil.rmtree(proc / "4242")
+        result = self.save(clone, "2026-11-05T00:36:00Z", DUO_STATE_PROC=str(proc))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.saved_rows(), ["start", "half done"])
 
     def test_a_save_never_writes_over_a_save_it_has_not_seen(self):
         self.started()
@@ -374,6 +417,33 @@ class PublishRepo(unittest.TestCase):
         (self.project / "duo" / "systematic.py").write_text(f"RUNNER = True\nPATH = '{home}'\n")
         self.refused("duo/systematic.py:2: a path on this Mac")
         self.assertEqual(tree(self.target), {"old.py"})
+
+    def test_a_home_folder_path_with_dashes_for_slashes_stops_it(self):
+        # How Claude names its session folders: a note pasted from one would publish the Mac's login. Split, as above.
+        session = "/private/tmp/claude-501/-" + "Users-someone-Library-Application-Support-Claude-x/scratchpad"
+        (self.project / "RUNBOOK.md").write_text(f"Checked in {session}.\n")
+        self.refused("RUNBOOK.md:1: a path on this Mac, written with dashes")
+        self.assertFalse(self.target.exists())
+
+    def test_a_file_that_is_not_utf8_stops_it(self):
+        # Read as UTF-8 regardless, UTF-16 puts a NUL between the letters, and the address would pass.
+        (self.project / "RUNBOOK.md").write_bytes(("Questions to " + "owner" + "@" + "duo-owner.uk\n").encode("utf-16"))
+        self.refused("RUNBOOK.md: not UTF-8 text")
+        self.assertFalse(self.target.exists())
+
+    def test_a_link_on_the_list_stops_it(self):
+        # A link is copied as what it points to, which can be a private file outside the project.
+        outside = self.tmp / "private"
+        (outside / "static").mkdir(parents=True)
+        (outside / "notes.txt").write_text("private notes\n")
+        (outside / "static" / "index.html").write_text("<html>private</html>\n")
+        (self.project / "duo" / "notes.py").symlink_to(outside / "notes.txt")
+        (self.project / "duo" / "alias.py").symlink_to("systematic.py")  # Even to a file in the project.
+        shutil.rmtree(self.project / "duo" / "static")
+        (self.project / "duo" / "static").symlink_to(outside / "static", target_is_directory=True)
+        problems = self.refused("duo/notes.py is a link", "duo/alias.py is a link", "duo/static/index.html is a link")
+        self.assertNotIn("nothing in project matches duo/static/*.html", problems)
+        self.assertFalse(self.target.exists())
 
     def test_a_dotenv_file_stops_it(self):
         self.refused(".env: a .env file", patterns=publish_repo.WHITELIST + (".env",))

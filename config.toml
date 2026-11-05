@@ -56,8 +56,8 @@ snapshot_minutes = 5        # How often the equity chart gets a new point.
 
 [systematic]
 # A research strategy traded by code, once a day, on paper. See README, "The systematic runner".
-# While this is on, the agents can't trade, the [portfolio], [fees] and [risk] sections above don't apply,
-# and everything goes to data/paper_systematic.db. Live mode is refused: see README, "Going live with the runner".
+# While this is on, the agents can't trade, the [portfolio], [fees] and [risk] sections above don't apply, and
+# everything goes to data/paper_systematic.db. Live mode is refused (README, "Going live with the systematic runner").
 enabled = true
 # The research's chosen fallback, for PAPER TRADING ONLY: F1 trend on BTC alone (50-day moving average) at a
 # 20% volatility target, the F1 winner chosen on development data. It did NOT pass the holdout gate: it failed G2

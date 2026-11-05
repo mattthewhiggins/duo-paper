@@ -1,8 +1,10 @@
 """Scheduled runs (python -m duo tick): one poll per fresh process every 15 to 60 minutes, as on GitHub Actions.
 
 Resting paper orders judged on Kraken's 1-minute candles between runs, gaps that are normal on a schedule, the slack on
-re-pricing and the taker switch, Binance's second host, the tick command's guards and exit codes, the probe and the
-status page command, and three days of scheduled runs on one database with every run built fresh.
+re-pricing and the taker switch, Binance's error count and its second host, quotes stamped well after a run's clock, a
+taker buy done in one fill, what an order's note says, Kraken numbers that aren't numbers, the tick command's guards
+and exit codes, the probe and the status page command, and three days of scheduled runs on one database with every
+run built fresh.
 
 No network: Binance and Kraken are the stand-ins in tests/sys_helpers.py, or urlopen patched to a canned reply.
 """
@@ -95,6 +97,35 @@ def quiet(summary_path=None):
     out = io.StringIO()
     with mock.patch.dict(os.environ, environ, clear=True), contextlib.redirect_stdout(out):
         yield out
+
+
+class FlakyBinance(FakeBinance):
+    """FakeBinance that also fails the klines calls whose numbers are in fail_calls, counting 1, 2, ... in calls."""
+
+    fail_calls = frozenset()
+
+    def klines(self, symbol, limit):
+        if len(self.calls) + 1 in self.fail_calls:
+            self.calls.append(("klines", symbol, limit))
+            raise sys_data.DataError("Binance klines: data-api.binance.vision: timed out")
+        return super().klines(symbol, limit)
+
+
+class LateMarket(PathMarket):
+    """PathMarket whose refreshes are stamped lags[0], lags[1], ... seconds after now in turn, the last repeating: the
+    poll's own, then decide's after the Binance calls. A new one stands for a new process."""
+
+    def __init__(self, path, now, lags, **kw):
+        super().__init__(path, now, **kw)
+        self.lags = lags
+
+    def refresh(self):
+        self.lag = self.lags[min(self.refreshes, len(self.lags) - 1)]
+        return super().refresh()
+
+
+def api_errors(env):
+    return json.loads(env.db.get("sys_api_errors"))
 
 
 class PathFills(unittest.TestCase):
@@ -260,7 +291,7 @@ class Thresholds(unittest.TestCase):
 
 class CancelsBookPathFills(unittest.TestCase):
     """A re-price or the switch to taker first books a fill that already happened on the path. Here the run's ticker
-    fails, so no fill check runs before them."""
+    fails, so no fill check runs before them. One whose path can't be read isn't cancelled: the next run judges it."""
 
     def test_a_reprice_books_a_fill_that_already_happened(self):
         env = cron_env()
@@ -289,6 +320,32 @@ class CancelsBookPathFills(unittest.TestCase):
         self.assertEqual([(f["liquidity"], f["ts"]) for f in fills(env, asset="BTC")], [("maker", D0 + 6900)])
         self.assertEqual(env.db.all("SELECT * FROM sys_children WHERE asset = 'BTC' AND kind = 'taker'"), [])
 
+    def test_a_reprice_that_cant_read_the_candles_leaves_it_open_for_the_next_run(self):
+        env = cron_env()
+        cron_run(env, D0 + 330)
+        btc = open_child(env, "BTC")
+        dip(env, "BTC", D0 + 720, float(btc["limit_price"]))  # 00:12
+        env.market.candles_fail = True
+        cron_run(env, D0 + 330 + 900)  # Time to re-price, but its path since 00:06 can't be read.
+        self.assertEqual(child_row(env, btc["id"])["status"], "open")
+        self.assertEqual(env.db.all("SELECT * FROM sys_children WHERE asset = 'BTC'")[1:], [], "nothing placed instead")
+        env.market.candles_fail = False
+        cron_run(env, D0 + 330 + 1800)  # The candles, 12 hours of them, cover its whole life so far.
+        self.assertEqual([(f["asset"], f["liquidity"], f["ts"]) for f in fills(env)], [("BTC", "maker", D0 + 720)])
+        self.assertEqual(child_row(env, btc["id"])["status"], "filled")
+
+    def test_a_reprice_with_kraken_down_leaves_it_open_for_the_next_run(self):
+        env = cron_env()
+        cron_run(env, D0 + 330)
+        btc = open_child(env, "BTC")
+        dip(env, "BTC", D0 + 720, float(btc["limit_price"]))
+        env.market.candles_fail, env.market.refresh_failures = True, 1  # No quotes and no candles this run.
+        cron_run(env, D0 + 330 + 900)
+        self.assertEqual(child_row(env, btc["id"])["status"], "open", "not 'missed' for want of a fresh quote")
+        env.market.candles_fail = False
+        cron_run(env, D0 + 330 + 1800)
+        self.assertEqual([(f["liquidity"], f["ts"]) for f in fills(env, asset="BTC")], [("maker", D0 + 720)])
+
 
 class CronHeartbeat(unittest.TestCase):
     def test_the_decision_alert_waits_out_the_grace_and_the_payload_says_cron(self):
@@ -305,6 +362,158 @@ class CronHeartbeat(unittest.TestCase):
         step(loop, D0 + 3600)
         payload = json.loads(loop.runner.heartbeat_path.read_text())
         self.assertEqual((payload["schedule"], payload["decision_overdue_minutes"]), ("loop", 30.0))
+
+
+def btc_held_env(bars):
+    """config.toml's BTC-only strategy in cron mode, with 0.1 BTC already held and no run before 00:00 UTC."""
+    price = rows_close_before(bars["BTC"], D0)
+    env = make_env("F1__sma_50__BTC__vol20", bars=bars, market=PathMarket(flat({"BTC": price}), D0, assets=("BTC",)),
+                   scheduled=True, max_asset_pct=Decimal(100))
+    env.binance = env.runner.binance = FlakyBinance(bars, D0)
+    env.db.execute("INSERT INTO fills(ts, source, asset, side, qty, price, gross, fee, realized, venue_id, liquidity) "
+                   "VALUES(?, 'systematic', 'BTC', 'buy', '0.1', ?, ?, '0', '0', 'paper-held', 'maker')",
+                   (D0 - 2 * DAY, repr(price), repr(price * 0.1)))
+    return env
+
+
+class BinanceErrors(unittest.TestCase):
+    """Binance's count of errors in a row clears whenever it answers, whichever call it answered."""
+
+    def test_the_day_starts_own_read_clears_the_count_so_the_days_sell_goes_out(self):
+        # The bar the decision uses, and every one after it, 40% down: far below its 50-day average, so it sells.
+        bars = {"BTC": [(t, o * 0.6, h * 0.6, low * 0.6, c * 0.6, v, q) if t >= D0 - DAY else (t, o, h, low, c, v, q)
+                        for t, o, h, low, c, v, q in series(20000.0, D0 + 10 * DAY, 710)]}
+        env = btc_held_env(bars)
+        runs = [D0 + 320 + k * 900 for k in range(9)]  # 00:05:20 to 02:05:20
+        # The decision run: the bar is there and so are the decision's bars, but the day start's own read fails.
+        env.binance.fail_calls = {2}
+        cron_run(env, runs[0])
+        self.assertEqual(len(env.binance.calls), 3)
+        self.assertEqual(tuple(env.db.one("SELECT side, status FROM sys_orders")), ("sell", "working"))
+        self.assertIsNone(env.db.get("sys_day_start"), "the day's start is still unknown")
+        env.binance.fail = True  # Down for 75 minutes. The day start's read is the only call to it now.
+        for now in runs[1:6]:
+            cron_run(env, now)
+        self.assertEqual(api_errors(env)["binance"], 5)
+        self.assertIn("too many API errors", env.db.one("SELECT note FROM sys_children ORDER BY id DESC")["note"])
+        env.binance.fail = False
+        cron_run(env, runs[6])
+        self.assertEqual(api_errors(env)["binance"], 0)
+        beat = env.db.one("SELECT * FROM sys_heartbeats ORDER BY id DESC LIMIT 1")
+        self.assertEqual((beat["status"], json.loads(beat["halts"])), ("ok", []))
+        sell = open_child(env, "BTC")
+        self.assertEqual((sell["side"], sell["placed_at"]), ("sell", runs[6]), "placed as soon as Binance answers")
+        for now in runs[7:]:
+            cron_run(env, now)
+        self.assertEqual([(f["liquidity"], f["ts"]) for f in fills(env, side="sell")], [("taker", runs[8])],
+                         "crossed at taker time")
+        self.assertEqual(env.runner.portfolio().qty("BTC"), 0)
+
+    def test_an_answer_without_the_bar_is_an_answer_too(self):
+        env = btc_held_env({"BTC": series(20000.0, D0 + 10 * DAY, 710)})
+        env.db.set("sys_api_errors", json.dumps({"binance": 3, "kraken": 0}))
+        env.binance.now, env.binance.missing = D0 + 320, {D0 - DAY}
+        book = env.runner.book(D0 + 320)
+        self.assertIsNone(env.runner._day_start(D0 + 320, D0, book, book.cash))
+        self.assertEqual(api_errors(env)["binance"], 0)
+
+
+class LateQuotes(unittest.TestCase):
+    """A run's quotes are stamped when fetched, after its fixed now. decide() fetches its own after the Binance calls,
+    and retries and timeouts can make that minutes later."""
+
+    def setUp(self):
+        self.config = make_sys_config()
+        self.bars = default_bars()
+        self.prices = {a: rows_close_before(rows, D0) for a, rows in self.bars.items()}
+
+    def tick(self, market, now, **kw):
+        """One run, then its database, read and closed."""
+        with quiet():
+            code = cli.tick_once(self.config, market=market, binance=FakeBinance(self.bars, now), now=now,
+                                 sleep=lambda s: None, **kw)
+        self.assertEqual(code, 0)
+        db = DB(self.config.db_path)
+        try:
+            return {table: db.all(f"SELECT * FROM {table} ORDER BY id")
+                    for table in ("sys_decisions", "sys_orders", "sys_children", "fills")}
+        finally:
+            db.conn.close()
+
+    def test_a_decision_whose_own_refresh_lands_90_s_late_places_its_orders(self):
+        rows = self.tick(LateMarket(flat(self.prices), D0 + 330, lags=(1.0, 90.0)), D0 + 330, first_run=True)
+        risk = json.loads(rows["sys_decisions"][0]["risk"])
+        fresh = next(c for c in risk["portfolio"] if c["control"] == "quote_fresh")
+        self.assertEqual(fresh["outcome"], "pass", fresh["detail"])
+        self.assertEqual([(c["asset"], c["kind"], c["status"]) for c in rows["sys_children"]],
+                         [("BTC", "maker", "open"), ("ETH", "maker", "open")])
+        self.assertEqual({o["note"] for o in rows["sys_orders"]}, {None})
+
+    def test_a_resting_orders_path_starts_after_the_quote_its_price_came_from(self):
+        # 00:05:30: the poll's quotes come at 00:05:31, and decide's, which price the orders, at 00:06:10.
+        rows = self.tick(LateMarket(flat(self.prices), D0 + 330, lags=(1.0, 40.0)), D0 + 330, first_run=True)
+        btc = rows["sys_children"][0]
+        market = PathMarket(flat(self.prices), D0 + 1230)
+        limit = float(btc["limit_price"])
+        for minute in (D0 + 360, D0 + 420):  # 00:06, which holds trades from before the price, and 00:07.
+            market.candles[("BTC", minute)] = (limit, limit, limit * THROUGH, limit)
+        rows = self.tick(market, D0 + 1230)
+        self.assertEqual([(f["asset"], f["ts"]) for f in rows["fills"]], [("BTC", D0 + 420)])
+        self.assertEqual((btc["asset"], btc["placed_at"], btc["priced_at"]), ("BTC", D0 + 330, D0 + 370))
+
+    def test_a_late_quote_doesnt_hold_back_the_next_runs_reprice(self):
+        # Priced on decide's quote 50 s after the run's clock. The next run is 810 s later, past the 780 s re-price.
+        rows = self.tick(LateMarket(flat(self.prices), D0 + 330, lags=(1.0, 50.0)), D0 + 330, first_run=True)
+        self.assertEqual((rows["sys_children"][0]["placed_at"], rows["sys_children"][0]["priced_at"]),
+                         (D0 + 330, D0 + 380))
+        rows = self.tick(PathMarket(flat(self.prices), D0 + 1140), D0 + 1140)
+        self.assertEqual([(c["status"], c["placed_at"]) for c in rows["sys_children"] if c["asset"] == "BTC"],
+                         [("cancelled", D0 + 330), ("open", D0 + 1140)])
+
+
+class Takers(unittest.TestCase):
+    def test_a_taker_buy_completes_its_order_in_one_fill(self):
+        env = cron_env()
+        cron_run(env, D0 + 330)  # A resting buy for each asset, which the flat path never fills.
+        s = env.config.systematic
+        due = D0 + 330 + s.taker_after_minutes * 60 - s.cron_slack_seconds
+        cron_run(env, due)
+        for order in env.db.all("SELECT * FROM sys_orders ORDER BY id"):
+            self.assertEqual([(f["liquidity"], f["ts"]) for f in fills(env, asset=order["asset"])], [("taker", due)])
+            self.assertEqual((order["status"], order["closed_at"]), ("filled", due))
+            wanted = Decimal(order["notional_wanted"])
+            self.assertGreaterEqual(Decimal(order["filled_gross"]), wanted * Decimal("0.999"))
+        for taker in env.db.all("SELECT * FROM sys_children WHERE kind = 'taker'"):
+            self.assertEqual({c["outcome"] for c in json.loads(taker["checks"])}, {"pass"})
+        self.assertGreater(env.runner.portfolio().cash, 0)
+
+
+class OrderNotes(unittest.TestCase):
+    def test_a_block_noted_on_an_order_goes_once_it_is_placed(self):
+        env = cron_env()
+        env.market.frozen = {"BTC": 700.0}  # Kraken's BTC quote unchanged for 700 s: no new orders on it.
+        cron_run(env, D0 + 330)
+        order_id = env.db.one("SELECT id FROM sys_orders WHERE asset = 'BTC'")["id"]
+
+        def note():
+            return env.db.one("SELECT note FROM sys_orders WHERE id = ?", (order_id,))["note"]
+
+        self.assertTrue(note().startswith("blocked: quote_fresh: quote unchanged for 700s"))
+        env.market.frozen = {}
+        cron_run(env, D0 + 1230)
+        btc = open_child(env, "BTC")
+        self.assertIsNone(note())
+        dip(env, "BTC", D0 + 1500, float(btc["limit_price"]))  # 00:25
+        cron_run(env, D0 + 2130)
+        self.assertEqual(env.db.one("SELECT status FROM sys_orders WHERE id = ?", (order_id,))["status"], "filled")
+        self.assertIsNone(note())
+        blocked = env.db.one("SELECT * FROM sys_children WHERE order_id = ? AND status = 'blocked'", (order_id,))
+        self.assertIn("frozen feed", blocked["note"], "the blocked child keeps it")
+        # A flatten's own note isn't a block or a wait: it stays.
+        env.runner.stop_trading(D0 + 2200, "requested by a test", flatten=True)
+        cron_run(env, D0 + 3030)
+        flatten = env.db.all("SELECT status, note FROM sys_orders WHERE source = 'kill_switch'")
+        self.assertEqual([tuple(o) for o in flatten], [("filled", "flatten at market, capped")])
 
 
 class BinanceHosts(unittest.TestCase):
@@ -359,21 +568,28 @@ class BinanceHosts(unittest.TestCase):
 
 class KrakenMinutes(unittest.TestCase):
     class Kraken:
-        def __init__(self, ohlc_fails=False):
-            self.ohlc_fails = ohlc_fails
+        """Kraken's public endpoints for XBTUSD, any of which can fail, and any number in them can be set."""
+
+        def __init__(self, ohlc_fails=False, pairs_fail=False, bid="70000.0", low="69990.0"):
+            self.ohlc_fails, self.pairs_fail = ohlc_fails, pairs_fail
+            self.bid, self.low = bid, low
             self.calls = []
 
         def public(self, method, **kw):
             self.calls.append((method, kw))
             if method == "AssetPairs":
+                if self.pairs_fail:
+                    raise KrakenNetworkError("timed out")
                 return {"XXBTZUSD": {"altname": "XBTUSD", "base": "XXBT", "quote": "ZUSD", "lot_decimals": 8,
                                      "pair_decimals": 1, "ordermin": "0.00005", "costmin": "0.5"}}
+            if method == "Ticker" and kw.get("pair") == "GBPUSD":
+                return {"ZGBPZUSD": {"c": ["1.25", "1"]}}
             if method == "Ticker":
-                return {"XXBTZUSD": {"b": ["70000.0", "1", "1"], "a": ["70000.1", "1", "1"], "c": ["70000.0", "0.1"],
+                return {"XXBTZUSD": {"b": [self.bid, "1", "1"], "a": ["70000.1", "1", "1"], "c": ["70000.0", "0.1"],
                                      "v": ["10", "100"], "t": [5, 50]}}
             if self.ohlc_fails:
                 raise KrakenNetworkError("timed out")
-            rows = [[D0 + 60 * k, "70000.0", "70010.0", "69990.0", "70005.0", "70001.0", "1.5", 12] for k in range(720)]
+            rows = [[D0 + 60 * k, "70000.0", "70010.0", self.low, "70005.0", "70001.0", "1.5", 12] for k in range(720)]
             return {"XXBTZUSD": rows, "last": D0 + 60 * 719}
 
     def test_one_minute_candles_once_per_run(self):
@@ -390,20 +606,68 @@ class KrakenMinutes(unittest.TestCase):
     def test_a_failure_is_kept_for_the_run_too(self):
         client = self.Kraken(ohlc_fails=True)
         market = SystematicMarket(client, "USD", {"BTC": "XBT"})
-        with self.assertRaises(ValueError) as caught:
-            market.minute_candles("BTC")
-        self.assertIn("no Kraken pair known", str(caught.exception))
-        fresh = SystematicMarket(client, "USD", {"BTC": "XBT"})
-        fresh.refresh()
+        market.refresh()
         for _ in range(2):
-            with self.assertRaises(ValueError):
-                fresh.minute_candles("BTC")
+            with self.assertRaises(ValueError) as caught:
+                market.minute_candles("BTC")
+            self.assertIn("timed out", str(caught.exception))
         self.assertEqual(sum(m == "OHLC" for m, _ in client.calls), 1)
+
+    def test_candles_asked_for_before_any_refresh_load_the_pairs_first(self):
+        # As in a run after a gap whose refreshes all failed: its old resting orders are judged before any refresh.
+        client = self.Kraken()
+        market = SystematicMarket(client, "USD", {"BTC": "XBT"})
+        self.assertEqual(len(market.minute_candles("BTC")), 720)
+        self.assertEqual([m for m, _ in client.calls], ["AssetPairs", "OHLC"])
+        down = self.Kraken(pairs_fail=True)
+        market = SystematicMarket(down, "USD", {"BTC": "XBT"})
+        for _ in range(2):
+            with self.assertRaises(ValueError) as caught:
+                market.minute_candles("BTC")
+            self.assertIn("KrakenNetworkError: timed out", str(caught.exception))
+        self.assertEqual([m for m, _ in down.calls], ["AssetPairs"], "Kraken down is kept for the run, as any failure")
 
     def test_the_other_intervals_are_as_before(self):
         market = Market(self.Kraken(), ("BTC",), "USD")
         with self.assertRaises(ValueError):
             market.candles("BTC", 5)
+
+
+class BadKrakenNumbers(unittest.TestCase):
+    """A number in Kraken's reply that isn't one is a ValueError, which every caller counts as Kraken failing, as it
+    does any bad reply. decimal's InvalidOperation isn't one, so it used to get past them all and fail the tick."""
+
+    def test_a_price_that_isnt_a_number_is_a_kraken_error(self):
+        for market in (SystematicMarket(KrakenMinutes.Kraken(bid="abc"), "USD", {"BTC": "XBT"}),
+                       Market(KrakenMinutes.Kraken(bid="abc"), ("BTC",), "USD")):
+            with self.subTest(market=type(market).__name__):
+                with self.assertRaises(ValueError) as caught:
+                    market.refresh()
+                self.assertEqual(str(caught.exception), "Kraken sent 'abc' as XXBTZUSD's bid, which isn't a number")
+
+    def test_a_tick_on_one_counts_a_kraken_error_and_still_beats(self):
+        config, bars, sleeps = make_sys_config(), default_bars(), []
+        market = SystematicMarket(KrakenMinutes.Kraken(bid="abc"), "USD", {"BTC": "XBT"})
+        with quiet() as out:
+            code = cli.tick_once(config, market=market, binance=FakeBinance(bars, D0 + 330), now=D0 + 330,
+                                 first_run=True, sleep=sleeps.append)
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(sleeps[:3], [2, 3, 5], "tried again, as a Kraken failure is")
+        db = DB(config.db_path)
+        self.addCleanup(db.conn.close)
+        self.assertGreaterEqual(json.loads(db.get("sys_api_errors"))["kraken"], 1)
+        self.assertEqual(db.one("SELECT status FROM sys_heartbeats")["status"], "degraded")
+        self.assertFalse(events(db, "The scheduled tick failed"))
+        self.assertTrue(events(db, "which isn't a number"))
+
+    def test_candles_that_arent_numbers_are_a_kraken_error_too(self):
+        for low in ("abc", "nan", None):  # A NaN low would stop the fill check itself, comparing it with a limit.
+            market = Market(KrakenMinutes.Kraken(low=low), ("BTC",), "USD")
+            market.load_pairs()
+            with self.subTest(low=low):
+                with self.assertRaises(ValueError) as caught:
+                    market.candles("BTC", 1)
+                self.assertIn("Kraken's XBTUSD candles", str(caught.exception))
 
 
 class Config(unittest.TestCase):
@@ -474,6 +738,7 @@ class Tick(unittest.TestCase):
         self.assertEqual(len(db.all("SELECT * FROM sys_decisions")), 1)
         self.assertEqual([b["ts"] for b in db.all("SELECT ts FROM sys_heartbeats")], [D0 + 300, D0 + 1200])
         self.assertEqual(len(events(db, "Paper run of")), 1, "started once")
+        self.assertEqual(float(db.get("sys_tick_at")), D0 + 1200, "when the latest tick began, for the status page")
 
     def test_flatten_sells_everything_and_halts(self):
         self.tick(D0 + 330, first_run=True)
@@ -526,6 +791,7 @@ class Tick(unittest.TestCase):
         db = self.db()
         self.assertTrue(events(db, "The scheduled tick failed"))
         self.assertEqual(len(db.all("SELECT * FROM sys_heartbeats")), 1, "no heartbeat from the failed run")
+        self.assertEqual(float(db.get("sys_tick_at")), D0 + 1200, "but its start is recorded, so the page can tell")
         wal = Path(f"{self.config.db_path}-wal")
         self.assertTrue(not wal.exists() or wal.stat().st_size == 0, "still checkpointed")
 
@@ -621,6 +887,20 @@ class Site(unittest.TestCase):
         config, db, out_dir = calls[0]
         self.assertEqual(out_dir, out)
         self.assertEqual(db.path, env.config.db_path)
+
+    def test_no_database_says_what_to_do_on_github_and_on_the_mac(self):
+        config = make_sys_config()  # site, compare, decisions, resume and status all open it this way.
+        with self.assertRaises(SystemExit) as stop:
+            cli.systematic_db(config)
+        for words in ("doesn't exist", "paper-state has no database", "action start (RUNBOOK 12.3)",
+                      "copy the GitHub run's database out first (RUNBOOK 12.7)", "./start.sh"):
+            self.assertIn(words, str(stop.exception))
+        with self.assertRaises(SystemExit) as stop:
+            cli.systematic_db(config, "resume")  # Resuming a copy on the Mac would leave the GitHub run halted.
+        self.assertIn("On the Mac, this can't reach the GitHub run: resume that with the Paper run workflow's action "
+                      "resume (RUNBOOK 12.5).", str(stop.exception))
+        self.assertNotIn("copy the GitHub run's database out", str(stop.exception))
+        self.assertFalse(config.db_path.exists())
 
 
 def cron_schedule(first_day: int, days: int, seed: int = 7) -> list[float]:

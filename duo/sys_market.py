@@ -18,9 +18,8 @@ import threading
 import time
 from decimal import Decimal
 
-from .config import D
 from .kraken import KrakenClient
-from .market import BENCHMARK_ASSET, MINUTE, Candle, Market, PairInfo, Quote
+from .market import BENCHMARK_ASSET, MINUTE, Candle, Market, PairInfo, Quote, kraken_number
 
 
 class SystematicMarket(Market):
@@ -59,7 +58,8 @@ class SystematicMarket(Market):
                 pairs[asset] = PairInfo(
                     asset=asset, key=key, altname=info["altname"], base_code=info["base"], quote_code=info["quote"],
                     lot_decimals=int(info["lot_decimals"]), pair_decimals=int(info["pair_decimals"]),
-                    ordermin=D(info.get("ordermin", 0)), costmin=D(info.get("costmin", 0)),
+                    ordermin=kraken_number(info.get("ordermin", 0), f"{key}'s ordermin"),
+                    costmin=kraken_number(info.get("costmin", 0), f"{key}'s costmin"),
                     online=info.get("status", "online") == "online",
                 )
         for asset in missing:
@@ -81,7 +81,9 @@ class SystematicMarket(Market):
                 asset = by_key.get(key)
                 if not asset:
                     continue
-                quotes[asset] = Quote(asset, D(ticker["b"][0]), D(ticker["a"][0]), D(ticker["c"][0]), now)
+                quotes[asset] = Quote(asset, kraken_number(ticker["b"][0], f"{key}'s bid"),
+                                      kraken_number(ticker["a"][0], f"{key}'s ask"),
+                                      kraken_number(ticker["c"][0], f"{key}'s last trade"), now)
                 signature = tuple(str(x) for x in (ticker["b"][0], ticker["a"][0], ticker["c"][0], ticker.get("v"),
                                                    ticker.get("t")))
                 if self._signatures.get(asset) != signature:
@@ -118,13 +120,18 @@ class SystematicMarket(Market):
         with its minute's start in seconds, the last one still forming.
 
         Read once per process and kept, failure included: a scheduled run is one process, so every resting order it
-        judges is judged on the same path, and a feed that's down isn't asked again for each one.
+        judges is judged on the same path, and a feed that's down isn't asked again for each one. If no refresh has
+        loaded the pairs yet (every refresh of the run so far failed), they're loaded here first, so the answer kept is
+        Kraken's own and not just that no pair was known.
         """
         with self._minutes_lock:
             if asset not in self._minutes:
                 try:
                     if asset not in self.pairs:
-                        raise ValueError(f"no Kraken pair known for {asset} yet")
+                        with self._lock:
+                            self.load_pairs()
+                    if asset not in self.pairs:
+                        raise ValueError(f"no Kraken pair known for {asset}")
                     self._minutes[asset] = self.candles(asset, MINUTE, 720)
                 except Exception as error:  # Whatever went wrong, the answer for this run is "no candles".
                     self._minutes[asset] = f"{type(error).__name__}: {error}"
@@ -137,7 +144,7 @@ class SystematicMarket(Market):
         """US dollars per pound, from Kraken's public GBPUSD ticker."""
         result = self.client.public("Ticker", pair="GBPUSD")
         ticker = next(iter(result.values()))
-        rate = D(ticker["c"][0])
-        if not rate.is_finite() or rate <= 0:
+        rate = kraken_number(ticker["c"][0], "the GBPUSD rate")
+        if rate <= 0:
             raise ValueError(f"GBPUSD rate {rate} isn't usable")
         return rate

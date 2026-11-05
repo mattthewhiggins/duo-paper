@@ -244,7 +244,7 @@ td ul { margin: 0; padding-left: 16px; }
   <div class="wrap">
     <p class="kicker">Paper trading · no real money</p>
     <h1>Duo paper run</h1>
-    <p class="lede" id="lede">Simulated orders at real prices, rebuilt after every scheduled run. No exchange keys, no real money. Not financial advice.</p>
+    <p class="lede" id="lede">Simulated orders at real prices, rebuilt after every scheduled run. No exchange keys, no real money. Not financial advice, and not a recommendation to buy, sell or hold anything.</p>
   </div>
 </header>
 
@@ -346,6 +346,11 @@ td ul { margin: 0; padding-left: 16px; }
 (() => {
   const REFRESH_SECONDS = 300;      // status.json is rebuilt after each run, at most every 15 minutes.
   const LINE_GAP_SECONDS = 6 * 3600; // Runs further apart than this aren't joined: nothing was checked in between.
+  const JOB_SECONDS = 900;          // A run builds the page within this of its tick starting (its job has 15 minutes).
+  const TICK_SECONDS = 600;         // Only for a database from before tick_at: a heartbeat this much older than the
+                                    // page means the run's tick wrote none.
+  const DISCLAIMER = "Not financial advice, and not a recommendation to buy, sell or hold anything.";
+  const HALTED_TEXT = "No decision is made while the run is halted, until it's resumed with the workflow's resume action.";
   const MINUS = "−";
   const DASH = "—";
   const SVGNS = "http://www.w3.org/2000/svg";
@@ -426,6 +431,10 @@ td ul { margin: 0; padding-left: 16px; }
   }
   function plural(n, word) {
     return `${n} ${word}${n === 1 ? "" : "s"}`;
+  }
+  function ordinal(n) {
+    const tens = n % 100, ones = n % 10;
+    return `${n}${tens >= 11 && tens <= 13 ? "th" : ones === 1 ? "st" : ones === 2 ? "nd" : ones === 3 ? "rd" : "th"}`;
   }
   function duration(minutes) {
     if (!isNum(minutes)) return DASH;
@@ -514,6 +523,7 @@ td ul { margin: 0; padding-left: 16px; }
     halted: '<circle cx="13" cy="13" r="12" fill="var(--critical)"/><rect x="8.5" y="8.5" width="9" height="9" rx="1.2" fill="#fff"/>',
     error: '<circle cx="13" cy="13" r="12" fill="var(--critical)"/><path d="M9 9l8 8M17 9l-8 8" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>',
     waiting: '<circle cx="13" cy="13" r="11" fill="none" stroke="var(--ink-3)" stroke-width="2"/><circle cx="8" cy="13" r="1.6" fill="var(--ink-3)"/><circle cx="13" cy="13" r="1.6" fill="var(--ink-3)"/><circle cx="18" cy="13" r="1.6" fill="var(--ink-3)"/>',
+    finished: '<circle cx="13" cy="13" r="12" fill="var(--ink-3)"/><path d="M7.5 13.5l3.6 3.6 7.4-8" fill="none" stroke="var(--surface)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>',
   };
   ICONS.loading = ICONS.waiting;
 
@@ -542,30 +552,67 @@ td ul { margin: 0; padding-left: 16px; }
     return midnight + 86400 + minutes[0] * 60;
   }
 
+  // ---- Today, by the reader's clock ----
+  // status.json is as of its build, and a page built before 00:00 UTC and read after it is about yesterday. So the day
+  // number, and whether today's decision is made, come from the reader's UTC date.
+
+  function utcMidnight(ts) {
+    return Math.floor(ts / 86400) * 86400;
+  }
+  function dayNumber(d, now) {
+    return Math.max(1, (utcMidnight(now) - utcMidnight(d.start.at)) / 86400 + 1);
+  }
+  function todayNow(d, now) {
+    const t = d.today, last = (d.decisions || [])[0];
+    if (!t) return null;
+    const midnight = utcMidnight(now), builtToday = utcMidnight(d.generated_at) === midnight;
+    return {
+      halted: t.halted === true,
+      // Today's decision is on the bar that closed at 00:00 UTC today.
+      decided: last ? isNum(last.bar_at) && last.bar_at >= midnight - 86400 : builtToday && t.decided === true,
+      due: isNum(t.due_from) ? midnight + (t.due_from % 86400) : null,  // Its time of day, today.
+      // Only a build from today can say today's decision is overdue: one of today's runs got past its time without it.
+      overdue: builtToday && isNum(t.overdue_minutes) && isNum(t.overdue_from) ? (now - t.overdue_from) / 60 : null,
+    };
+  }
+
   // ---- Sections ----
 
   function lede(d) {
     const start = d.start, strategy = d.strategy;
     if (!start || !strategy) {
-      fill("lede", "No paper run has started yet. Simulated orders at real prices; no exchange keys, no real money. Not financial advice.");
+      fill("lede", `No paper run has started yet. Simulated orders at real prices; no exchange keys, no real money. ${DISCLAIMER}`);
       return;
     }
-    const progress = start.complete
-      ? `day ${start.day}: the ${start.target_days}-day run ended ${longDate(start.ends_at - 1)}`
-      : `day ${start.day} of ${start.target_days}`;
-    fill("lede", "Paper trading ", el("strong", null, el("code", { text: strategy.id })), `, ${progress}, started ${longDate(start.at)}. `,
-      "Simulated orders at real prices: no exchange keys, no real money. Not financial advice.");
+    fill("lede", "Paper trading ", el("strong", null, el("code", { text: strategy.id })),
+      `, started ${longDate(start.at)}: ${progress(d, nowSeconds())}. `,
+      `Simulated orders at real prices: no exchange keys, no real money. ${DISCLAIMER}`);
+  }
+
+  // How far the test has got. Its 28 days are finished days compared with the backtest (RUNBOOK section 1), and a
+  // day only counts once the next day's decision is made.
+  function progress(d, now) {
+    const start = d.start, target = start.target_days;
+    if (start.complete) {
+      return `the ${target}-day test is complete (${whole(start.days_compared)} finished days compared), and the runs carry on until the workflow is disabled (RUNBOOK section 12.6)`;
+    }
+    return `day ${dayNumber(d, now)}, and ${isNum(start.days_compared) ? whole(start.days_compared) : DASH} of ${target} finished days compared`;
   }
 
   function banner(d) {
     const now = nowSeconds();
     const hb = d.heartbeat;
-    const staleAfter = (isNum(d.stale_after_minutes) ? d.stale_after_minutes : 150) * 60;
+    const staleAfter = (isNum(d.stale_after_minutes) ? d.stale_after_minutes : 195) * 60;
     const age = now - d.generated_at;
     const next = nextSlot(d, now);
     const nextLine = next ? `The next run is scheduled for ${when(next)}. GitHub often starts runs late, by up to an hour when it's busy.` : null;
     if (!d.start) {
       setBanner("waiting", "No paper run yet", ["The database has no paper run in it yet. Scheduled runs never start one by themselves: run the Paper run workflow once with action start."], nextLine);
+    } else if (age > staleAfter && d.start.complete) {
+      setBanner("finished", "Finished", [
+        `The ${d.start.target_days}-day test is complete, with ${whole(d.start.days_compared)} finished days compared, and no run has updated this page since ${when(d.generated_at)}, ${ago(age)}.`,
+        "That's what disabling the workflow at the end does (RUNBOOK section 12.6). The figures below are from that last run.",
+      ], "If the runs should still be going, check the repository's Actions tab.");
     } else if (age > staleAfter) {
       const last = hb ? `The last run was ${when(hb.at)}, ${ago(now - hb.at)}.` : "No run has finished yet.";
       setBanner("stale", "Stale: not updated lately", [
@@ -579,18 +626,35 @@ td ul { margin: 0; padding-left: 16px; }
         `The page was rebuilt ${when(d.generated_at)}, but the last run that checked the market was ${when(hb.at)}, ${ago(now - hb.at)}.`,
         "Runs may be failing. Check the repository's Actions tab.",
       ]);
-    } else if (hb.status === "halted") {
-      setBanner("halted", "Halted", [
-        hb.reasons && hb.reasons.length ? hb.reasons : ["The kill switch is on. Nothing new trades until it's resumed."],
-        `Last run ${when(hb.at)}, ${ago(now - hb.at)}.`,
-      ], "To resume: run the Paper run workflow by hand with action resume (RUNBOOK section 12.3).");
-    } else if (hb.status === "degraded") {
-      setBanner("attention", "Needs attention", [
-        `At the last run, ${when(hb.at)} (${ago(now - hb.at)}), the runner wasn't trading normally:`,
-        hb.reasons && hb.reasons.length ? hb.reasons : ["It didn't say why."],
-      ], "Most of these clear by themselves at a later run. The kill switch is the only one that waits for you.");
     } else {
-      setBanner("ok", "Running normally", [`Last run ${when(hb.at)}, ${ago(now - hb.at)}. Every check passed.`], nextLine);
+      const v = todayNow(d, now);
+      // tick_at is when the latest tick began. A heartbeat from before it, or a page built after that tick's job must
+      // have ended (so this run's tick never began), means the latest run's tick didn't finish.
+      const failed = (isNum(d.tick_at) ? d.tick_at > hb.at || d.generated_at - d.tick_at > JOB_SECONDS
+        : d.generated_at - hb.at > TICK_SECONDS)
+        ? `The latest run's tick didn't finish: its Tick step, on the repository's Actions tab, says why. The figures below are from the last run that did, ${when(hb.at)} (${ago(now - hb.at)}).`
+        : null;
+      const overdue = v && isNum(v.overdue)
+        ? `Today's decision is ${duration(v.overdue)} overdue, although runs are happening: the Tick step's log, on the repository's Actions tab, says why.`
+        : null;
+      if (hb.status === "halted") {
+        setBanner("halted", "Halted", [
+          hb.reasons && hb.reasons.length ? hb.reasons : ["The kill switch is on. Nothing new trades until it's resumed."],
+          failed || `Last run ${when(hb.at)}, ${ago(now - hb.at)}.`,
+        ], "To resume: run the Paper run workflow by hand with action resume (RUNBOOK section 12.3).");
+      } else if (failed) {
+        setBanner("attention", "Needs attention", [failed], nextLine);
+      } else if (hb.status === "degraded") {
+        setBanner("attention", "Needs attention", [
+          overdue,
+          `At the last run, ${when(hb.at)} (${ago(now - hb.at)}), the runner wasn't trading normally:`,
+          hb.reasons && hb.reasons.length ? hb.reasons : ["It didn't say why."],
+        ], "Most of these clear by themselves at a later run. The kill switch is the only one that waits for you.");
+      } else if (overdue) {
+        setBanner("attention", "Needs attention", [overdue, `Last run ${when(hb.at)}, ${ago(now - hb.at)}.`], nextLine);
+      } else {
+        setBanner("ok", "Running normally", [`Last run ${when(hb.at)}, ${ago(now - hb.at)}. Every check passed.`], nextLine);
+      }
     }
   }
 
@@ -601,7 +665,7 @@ td ul { margin: 0; padding-left: 16px; }
   }
 
   function tiles(d) {
-    const eq = d.equity, hold = d.hold_btc, h = d.holdings, today = d.today;
+    const eq = d.equity, hold = d.hold_btc, h = d.holdings, v = todayNow(d, nowSeconds());
     const out = [];
     if (eq) {
       const fx = eq.gbp_usd || {};
@@ -612,6 +676,7 @@ td ul { margin: 0; padding-left: 16px; }
       out.push(tile("Since the start", signedPct(eq.return_usd), [
         `${signedMoney(eq.change_usd, "USD")} in dollars, from ${money(eq.start_usd, "USD", 0)}.`,
         `${signedPct(eq.return_gbp)} (${signedMoney(eq.change_gbp, "GBP")}) in pounds, from ${money(eq.start_gbp, "GBP", 0)}.`,
+        eq.gbp_note,
       ], direction(eq.return_usd)));
     } else {
       out.push(tile("Value now", DASH, ["No run has valued the account yet."]));
@@ -631,21 +696,26 @@ td ul { margin: 0; padding-left: 16px; }
         `Cash ${money(h.cash, "USD")}${isNum(h.cash_weight) ? ` (${pct(h.cash_weight)})` : ""}.`,
       ]));
     }
+    // The paper strategy's own state, from its latest decision: what it holds, and why.
     const last = (d.decisions || [])[0];
+    const which = last ? "Today's decision" : "The first decision";
+    const pending = !v ? null : v.halted ? HALTED_TEXT : v.decided ? null
+      : isNum(v.overdue) ? `${which} is ${duration(v.overdue)} overdue: see Run health below.`
+      : `${which} is due at the first run after ${when(v.due)}.`;
     if (last) {
       const on = last.signal_on;
       const where = isNum(last.close) && isNum(last.average)
         ? `close ${money(last.close, "USD", 0)} is ${last.close > last.average ? "above" : last.close < last.average ? "below" : "at"} its ${last.average_days}-day average, ${money(last.average, "USD", 0)}`
         : null;
-      out.push(tile(today && today.decided ? "Today's signal" : "Latest signal", on === null ? "Unknown" : on ? "On" : "Off", [
-        `${on ? "Holding BTC" : on === false ? "In cash" : "Signal unknown"}${where ? `: ${where}` : ""}, on the bar of ${day(last.bar_at)}.`,
+      out.push(tile(v && v.decided ? "The strategy today (paper)" : "The strategy's latest decision (paper)",
+        on === null ? "Unknown" : on ? "In BTC" : "In cash", [
+        `${on ? "Signal on" : on === false ? "Signal off" : "Signal unknown"}${where ? `: ${where}` : ""}, on the bar of ${day(last.bar_at)}.`,
         isNum(last.target_weight) ? `Target ${pct(last.target_weight)} of the account in BTC.` : null,
-        today && !today.decided ? `Today's decision is due at the first run after ${when(today.due_from)}.` : `Decided ${when(last.decided_at)}.`,
+        `Decided ${when(last.decided_at)}.`,
+        pending,
       ]));
     } else {
-      out.push(tile("Today's signal", "Not yet", [
-        today ? `The first decision is due at the first run after ${when(today.due_from)}.` : "No decision yet.",
-      ]));
+      out.push(tile("The strategy today (paper)", "No decision yet", [pending || "No decision yet."]));
     }
     fill("tiles", out);
   }
@@ -674,7 +744,7 @@ td ul { margin: 0; padding-left: 16px; }
     if (c) {
       notes.push(c.equity_source);
       notes.push(c.hold_source || c.hold_note);
-      if (c.every_nth_run > 1) notes.push(`Every ${c.every_nth_run}th run is drawn (${whole(c.runs_valued)} runs in all), and always the latest.`);
+      if (c.every_nth_run > 1) notes.push(`Every ${ordinal(c.every_nth_run)} run is drawn (${whole(c.runs_valued)} runs in all), with each day's last and always the latest.`);
       notes.push("The thin line is the starting capital.");
     }
     fill("chart-note", notes.filter(Boolean).join(" "));
@@ -854,7 +924,7 @@ td ul { margin: 0; padding-left: 16px; }
 
   function chartTable(points, hasHold) {
     const days = new Map();
-    for (const p of points) days.set(Math.floor(p.at / 86400), p);  // The last run of each UTC day.
+    for (const p of points) days.set(Math.floor(p.at / 86400), p);  // The last run of each UTC day: site.py keeps each.
     const rows = [...days.values()].reverse().map((p) => el("tr", null,
       cell(when(p.at), "nowrap", true), cell(money(p.equity), "num"), hasHold ? cell(money(p.hold), "num") : null));
     const headings = [{ label: "Last run of the day" }, { label: "Paper account", num: true }];
@@ -865,7 +935,7 @@ td ul { margin: 0; padding-left: 16px; }
   // ---- Decisions, orders and fills ----
 
   function decisions(d) {
-    const list = d.decisions || [];
+    const list = d.decisions || [], v = todayNow(d, nowSeconds());
     const avgDays = (list.find((x) => x.average_days) || {}).average_days;
     const rows = list.map((x) => el("tr", null,
       cell([day(x.bar_at), el("span", { class: "line-2", text: isNum(x.decided_at) ? `decided ${shortDay(x.decided_at)}, ${clock(x.decided_at)} UTC` : "" })], "nowrap", true),
@@ -881,7 +951,7 @@ td ul { margin: 0; padding-left: 16px; }
       { label: avgDays ? `${avgDays}-day average` : "Average", num: true }, { label: "Signal" },
       { label: "Volatility, a year", num: true }, { label: "Target in BTC", num: true },
       { label: "What it decided, and what happened", cls: "wide" },
-    ], rows, d.today ? `No decision yet. The first is due at the first run after ${when(d.today.due_from)}.` : "No decision yet.");
+    ], rows, `No decision yet.${!v ? "" : v.halted ? ` ${HALTED_TEXT}` : ` The first is due at the first run after ${when(v.due)}.`}`);
     const latest = list[0];
     const volDays = ((d.strategy || {}).params || {}).W;
     fill("decisions-note", "One a day, on the daily bar that closed at 00:00 UTC. ",
@@ -1022,21 +1092,30 @@ td ul { margin: 0; padding-left: 16px; }
     return fixed(v, 2);
   }
 
+  // The runs in a window against its scheduled slots, both counted from after the start.
+  function runCount(runs, slots) {
+    if (!isNum(runs) || !isNum(slots)) return DASH;
+    if (!slots) return runs ? `${plural(runs, "run")} started by hand: no run has been scheduled since the start` : "None yet: no run has been scheduled since the start";
+    return `${plural(runs, "run")} (including any started by hand) for ${plural(slots, "scheduled slot")}`;
+  }
+
   function health(d) {
     const now = nowSeconds();
-    const r = d.runs, hb = d.heartbeat;
+    const r = d.runs, hb = d.heartbeat, v = todayNow(d, now);
     const next = nextSlot(d, now);
     facts("health-facts", r ? [
       ["Last run", r.last_at ? `${when(r.last_at)}, ${ago(now - r.last_at)}` : "None yet",
         hb ? `${hb.status_text}.${hb.reasons && hb.reasons.length ? ` ${hb.reasons.join(" ")}` : ""}` : null],
       ["Next scheduled run", next ? when(next) : DASH, "GitHub often starts scheduled runs late, by 5 to 60 minutes when it's busy, and sometimes skips them."],
-      ["Runs in the last 24 hours", `${whole(r.last_24h)} of ${whole(r.scheduled_24h)} scheduled`,
+      ["Runs in the last 24 hours", runCount(r.last_24h, r.scheduled_24h),
         isNum(r.longest_gap_24h_minutes) ? `Longest gap between runs: ${duration(r.longest_gap_24h_minutes)} (the schedule's longest is ${duration(r.scheduled_longest_gap_minutes)}).` : null],
-      ["Runs in the last 7 days", `${whole(r.last_7d)} of ${whole(r.scheduled_7d)} scheduled`],
+      ["Runs in the last 7 days", runCount(r.last_7d, r.scheduled_7d)],
       ["Runs since the start", whole(r.total), r.first_at ? `The first was ${when(r.first_at)}.` : null],
       ["Schedule", `${whole((r.schedule || {}).per_day)} runs a day`, (r.schedule || {}).summary],
-      ["Today's decision", d.today ? (d.today.decided ? "Made" : "Not made yet") : DASH,
-        d.today && isNum(d.today.overdue_minutes) ? `Overdue by ${duration(d.today.overdue_minutes)}: the daily bar or the runs may be late.` : d.today && !d.today.decided ? `Due at the first run after ${when(d.today.due_from)}.` : null],
+      ["Today's decision", !v ? DASH : v.decided ? "Made" : v.halted ? "None while halted" : "Not made yet",
+        !v ? null : v.halted ? HALTED_TEXT : v.decided ? null
+          : isNum(v.overdue) ? `Overdue by ${duration(v.overdue)}: runs have happened since it was due, and none has made it. The Tick step's log, on the repository's Actions tab, says why.`
+          : `Due at the first run after ${when(v.due)}.`],
     ] : [["Runs", "None yet"]]);
     const controls = (hb && hb.controls) || [];
     table("checks-table", [
@@ -1057,9 +1136,12 @@ td ul { margin: 0; padding-left: 16px; }
       ...((s && s.notes) || []),
     ]);
     const capital = start ? `${money(start.capital_gbp, "GBP", 0)}, as ${money(start.capital_usd, "USD", 2)}` : null;
+    const target = start && start.target_days;
     facts("about-facts", start ? [
       ["Strategy", el("code", { text: s ? s.id : DASH })],
-      ["Started", when(start.at), `Day ${start.day} of ${start.target_days}; the ${start.target_days} days end ${when(start.ends_at)}.`],
+      ["Started", when(start.at), start.complete
+        ? `The ${target}-day test is complete, with ${whole(start.days_compared)} finished days compared. The runs carry on until the workflow is disabled (RUNBOOK section 12.6).`
+        : `Day ${dayNumber(d, nowSeconds())}, and ${isNum(start.days_compared) ? whole(start.days_compared) : DASH} of ${target} finished days compared. The ${ordinal(target)} counts at the first run after ${when(start.ends_at)}, at the earliest.`],
       ["Starting capital", capital, `Converted at GBP/USD ${isNum(start.gbp_usd) ? start.gbp_usd.toFixed(4) : DASH}, less ${fixed(start.funding_fx_bps / 100, 2)}% for the conversion.`],
       ["Fees", `${fixed(start.maker_pct, 2)}% maker, ${fixed(start.taker_pct, 2)}% taker`, "Kraken Pro's tier 3, which the research's account size qualifies for."],
       ["Paper fills", `A resting order fills only once the market trades ${fixed(start.trade_through_pct, 2)}% through it, at its own price.`],
