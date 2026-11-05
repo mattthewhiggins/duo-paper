@@ -1,0 +1,1201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duo</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --raised: #f0efec;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --ink-3: #6f6d68;
+  --grid: #e1e0d9;
+  --baseline: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --up: #006300;
+  --down: #c62f2f;
+  --warn-ink: #8a5a00;
+  --warn: #fab219;
+  --critical: #d03b3b;
+  --good: #0ca30c;
+  --tint-1: #cde2fb;
+  --tint-1-ink: #104281;
+  --tint-2: #fbdccd;
+  --tint-2-ink: #7f2f0c;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --raised: #262624;
+    --ink: #f0efec;
+    --ink-2: #c3c2b7;
+    --ink-3: #9d9b93;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --up: #0ca30c;
+    --down: #ec6a6a;
+    --warn-ink: #fab219;
+    --tint-1: #184f95;
+    --tint-1-ink: #cde2fb;
+    --tint-2: #7f3a1c;
+    --tint-2-ink: #fbdccd;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --raised: #262624;
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --ink-3: #9d9b93;
+  --grid: #2c2c2a;
+  --baseline: #383835;
+  --border: rgba(255, 255, 255, 0.10);
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --up: #0ca30c;
+  --down: #ec6a6a;
+  --warn-ink: #fab219;
+  --tint-1: #184f95;
+  --tint-1-ink: #cde2fb;
+  --tint-2: #7f3a1c;
+  --tint-2-ink: #fbdccd;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+h1, h2, h3, p { margin: 0; }
+h2 { font-size: 14px; font-weight: 600; }
+button { font: inherit; color: inherit; cursor: pointer; }
+a { color: inherit; }
+:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; border-radius: 4px; }
+
+.wrap { max-width: 1320px; margin: 0 auto; padding: 0 24px 48px; }
+
+/* Top bar */
+.top {
+  position: sticky; top: 0; z-index: 5;
+  background: var(--page);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 20px;
+}
+.top-inner {
+  max-width: 1320px; margin: 0 auto; padding: 12px 24px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+}
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand h1 { font-size: 17px; font-weight: 650; }
+.badge {
+  font-size: 11px; font-weight: 650; letter-spacing: 0.05em;
+  padding: 2px 7px; border-radius: 5px;
+  background: var(--raised); color: var(--ink-2);
+}
+.badge.live { background: var(--critical); color: #fff; }
+.status { flex: 1 1 280px; min-width: 0; color: var(--ink-2); display: flex; gap: 8px; align-items: baseline; }
+.status-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); transform: translateY(-1px); }
+.status[data-code="active"] .status-dot { background: var(--series-1); animation: pulse 1.4s ease-in-out infinite; }
+.status[data-code="idle"] .status-dot { background: var(--good); }
+.status[data-code="warn"] .status-dot, .status[data-code="setup"] .status-dot { background: var(--warn); }
+.status[data-code="halted"] .status-dot { background: var(--critical); }
+@keyframes pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .status-dot { animation: none !important; } }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.btn {
+  padding: 6px 12px; min-height: 34px; border-radius: 7px;
+  background: var(--surface); border: 1px solid var(--baseline);
+  font-weight: 550; font-size: 13px;
+}
+.btn:hover:not(:disabled) { background: var(--raised); }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn.danger { color: var(--down); }
+.btn.solid-danger { background: var(--critical); border-color: var(--critical); color: #fff; }
+
+.banner {
+  margin-bottom: 16px; padding: 10px 14px; border-radius: 8px;
+  background: var(--surface); border: 1px solid var(--critical); color: var(--ink);
+}
+
+/* Cards */
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; min-width: 0; }
+.card-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; margin-bottom: 12px; }
+.muted { color: var(--ink-3); }
+.small { font-size: 12.5px; }
+.empty { color: var(--ink-3); padding: 14px 0; }
+
+/* Summary */
+.summary { display: grid; grid-template-columns: minmax(280px, 5fr) 7fr; gap: 14px; margin-bottom: 14px; }
+.hero-label { color: var(--ink-2); font-weight: 550; }
+.hero-value { font-size: 52px; line-height: 1.12; font-weight: 620; letter-spacing: -0.02em; margin: 2px 0 4px; }
+.hero-sub { color: var(--ink-2); }
+.hero-compare { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--grid); color: var(--ink-2); }
+.tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.tile { padding: 14px 16px; }
+.tile-label { color: var(--ink-2); font-size: 12.5px; }
+.tile-value { font-size: 22px; font-weight: 600; margin-top: 2px; letter-spacing: -0.01em; }
+.up { color: var(--up); }
+.down { color: var(--down); }
+
+/* Layout */
+.grid { display: grid; grid-template-columns: minmax(0, 8fr) minmax(0, 4fr); gap: 14px; margin-bottom: 14px; align-items: start; }
+.stack { display: grid; gap: 14px; min-width: 0; }
+
+/* Chart */
+.ranges { display: inline-flex; gap: 2px; padding: 2px; background: var(--raised); border-radius: 8px; }
+.ranges button { border: 0; background: transparent; padding: 3px 10px; border-radius: 6px; font-size: 12.5px; min-height: 26px; color: var(--ink-2); }
+.ranges button[aria-pressed="true"] { background: var(--surface); color: var(--ink); font-weight: 600; box-shadow: 0 0 0 1px var(--border); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; color: var(--ink-2); font-size: 12.5px; margin-bottom: 6px; }
+.legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.key { display: inline-block; width: 14px; height: 2px; border-radius: 1px; }
+.chart-box { position: relative; }
+.chart-box svg { display: block; width: 100%; touch-action: pan-y; }
+.chart-box svg:focus-visible { outline-offset: 4px; }
+.tick { fill: var(--ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+.end-label { fill: var(--ink-2); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.tip {
+  position: absolute; top: 8px; pointer-events: none; z-index: 2;
+  background: var(--surface); border: 1px solid var(--baseline); border-radius: 8px;
+  padding: 8px 10px; font-size: 12.5px; white-space: nowrap;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+}
+.tip-time { color: var(--ink-3); margin-bottom: 4px; }
+.tip-row { display: flex; align-items: center; gap: 7px; }
+.tip-row b { font-weight: 650; font-variant-numeric: tabular-nums; }
+.tip-row span:last-child { color: var(--ink-2); }
+details.table-view { margin-top: 10px; }
+details > summary { cursor: pointer; }
+.table-view summary { color: var(--ink-3); font-size: 12.5px; }
+.scroll-x { overflow-x: auto; }
+
+/* Tables */
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th { text-align: left; font-weight: 550; color: var(--ink-3); font-size: 12px; padding: 4px 10px 6px 0; white-space: nowrap; border-bottom: 1px solid var(--grid); }
+td { padding: 8px 10px 8px 0; border-bottom: 1px solid var(--grid); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+th.num { text-align: right; }
+th:last-child, td:last-child { padding-right: 0; }
+.sub { display: block; color: var(--ink-3); font-size: 12px; font-weight: 400; }
+.asset { font-weight: 600; }
+.side { display: inline-block; font-weight: 600; min-width: 28px; }
+.reason { color: var(--ink-2); min-width: 220px; max-width: 420px; }
+
+.prices { display: flex; flex-wrap: wrap; gap: 2px 14px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+
+/* Limits */
+.limit { margin-bottom: 11px; }
+.limit:last-child { margin-bottom: 0; }
+.limit-top { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; color: var(--ink-2); margin-bottom: 4px; }
+.limit-top b { font-weight: 550; color: var(--ink); font-variant-numeric: tabular-nums; }
+.meter { height: 6px; border-radius: 3px; background: var(--raised); overflow: hidden; }
+.meter i { display: block; height: 100%; border-radius: 3px; background: var(--series-1); }
+.meter i.warn { background: var(--warn); }
+.meter i.critical { background: var(--critical); }
+
+/* Conversation */
+.feed-tabs { display: inline-flex; gap: 2px; padding: 2px; background: var(--raised); border-radius: 8px; }
+.feed-tabs button { border: 0; background: transparent; padding: 3px 10px; border-radius: 6px; font-size: 12.5px; min-height: 26px; color: var(--ink-2); }
+.feed-tabs button[aria-pressed="true"] { background: var(--surface); color: var(--ink); font-weight: 600; box-shadow: 0 0 0 1px var(--border); }
+.note { font-size: 13px; color: var(--ink-2); overflow-wrap: anywhere; white-space: pre-wrap; }
+.note time { display: block; color: var(--ink-3); font-size: 12px; }
+.notes { display: grid; gap: 9px; max-height: 320px; overflow-y: auto; }
+.feed { display: grid; gap: 10px; max-height: 760px; overflow-y: auto; padding-right: 4px; margin-right: -4px; overscroll-behavior: contain; }
+.session { border: 1px solid var(--grid); border-radius: 8px; }
+.session > summary {
+  list-style: none; display: grid; grid-template-columns: 1fr auto; gap: 2px 12px;
+  padding: 10px 12px;
+}
+.session > summary::-webkit-details-marker { display: none; }
+.session > summary:hover { background: var(--raised); border-radius: 8px; }
+.session-title { font-weight: 600; }
+.session-title::before { content: "›"; display: inline-block; width: 12px; color: var(--ink-3); transition: transform 0.1s; }
+.session[open] .session-title::before { transform: rotate(90deg); }
+.session-meta { color: var(--ink-3); font-size: 12.5px; padding-left: 12px; grid-column: 1; }
+.session-summary { color: var(--ink-2); font-size: 13px; padding-left: 12px; grid-column: 1 / -1; }
+.chip { font-size: 12px; font-weight: 550; color: var(--ink-2); display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3); }
+.chip.good::before { background: var(--good); }
+.chip.warn::before { background: var(--warn); }
+.chip.bad::before { background: var(--critical); }
+.chip.active::before { background: var(--series-1); }
+.session-body { padding: 4px 12px 12px; display: grid; gap: 14px; border-top: 1px solid var(--grid); padding-top: 12px; }
+.msg { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 10px; }
+.avatar {
+  width: 30px; height: 30px; border-radius: 50%;
+  display: grid; place-items: center; font-weight: 650; font-size: 12.5px;
+}
+.avatar.strategist { background: var(--tint-1); color: var(--tint-1-ink); }
+.avatar.risk { background: var(--tint-2); color: var(--tint-2-ink); }
+.msg-head { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; margin-bottom: 2px; }
+.msg-name { font-weight: 600; }
+.msg-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg-note { color: var(--ink-3); font-size: 12.5px; white-space: pre-wrap; padding-left: 40px; overflow-wrap: anywhere; }
+.proposal { margin-top: 8px; display: grid; gap: 6px; }
+.proposal-item { background: var(--raised); border-radius: 7px; padding: 7px 10px; font-size: 13px; overflow-wrap: anywhere; }
+.proposal-item b { font-weight: 600; }
+.blocked { color: var(--warn-ink); display: block; margin-top: 2px; }
+.reasoning { margin-top: 6px; font-size: 12.5px; color: var(--ink-3); }
+.reasoning p { white-space: pre-wrap; margin-top: 4px; color: var(--ink-2); overflow-wrap: anywhere; }
+
+/* Waiting orders */
+.order-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--grid); }
+.order-row:first-child { padding-top: 0; }
+.order-row:last-child { border-bottom: 0; padding-bottom: 0; }
+.order-main { min-width: 0; overflow-wrap: anywhere; }
+.order-main b { font-weight: 600; }
+.order-sub { display: block; color: var(--ink-3); font-size: 12.5px; }
+.btn-small { padding: 3px 9px; min-height: 28px; font-size: 12px; border-radius: 6px; flex: none; }
+
+/* Strategy and activity */
+.strategy-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.events { display: grid; gap: 9px; max-height: 320px; overflow-y: auto; }
+.event { font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere; white-space: pre-wrap; }
+.event time { display: block; color: var(--ink-3); font-size: 12px; }
+.event.critical { color: var(--down); }
+
+dialog {
+  border: 1px solid var(--baseline); border-radius: 12px; padding: 20px;
+  background: var(--surface); color: var(--ink); max-width: min(440px, calc(100vw - 32px));
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.4); }
+dialog h2 { font-size: 16px; margin-bottom: 8px; }
+dialog p { color: var(--ink-2); }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+@media (max-width: 1000px) {
+  .summary, .grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 620px) {
+  .wrap { padding: 0 16px 32px; }
+  .top { position: static; }
+  .top-inner { padding: 12px 16px; }
+  .actions { width: 100%; }
+  .actions .btn { flex: 1 1 auto; }
+  .card { padding: 14px; }
+  .hero-value { font-size: 44px; }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .feed { max-height: 640px; }
+}
+.sys-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.sys-grid h3 { font-size: 13px; margin: 0 0 8px; }
+.sys-kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
+.sys-kv dt { color: var(--ink-3); }
+.sys-kv dd { margin: 0; overflow-wrap: anywhere; }
+.pass { color: var(--up); }
+.fail { color: var(--down); font-weight: 600; }
+/* Systematic mode: the runner's own limits, and the agents shown as unable to trade */
+[hidden] { display: none !important; }
+.limit-note { color: var(--ink-3); font-size: 12px; margin-top: 3px; }
+.grid.solo { grid-template-columns: minmax(0, 1fr); }
+.agents-note { margin-bottom: 14px; color: var(--ink-2); }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="top-inner">
+    <div class="brand"><h1>Duo</h1><span class="badge" id="mode">…</span></div>
+    <p class="status" id="status" role="status"><span class="status-dot"></span><span id="status-text">Connecting…</span></p>
+    <div class="actions">
+      <button class="btn" id="wake" type="button" title="Start a session now. It uses API budget.">Wake agents</button>
+      <button class="btn" id="halt" type="button" title="Stops the agents and any new trades. Stop-losses stay armed.">Stop trading</button>
+      <button class="btn danger" id="flatten" type="button">Sell everything</button>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="banner" id="banner" role="alert" hidden></div>
+
+  <section class="summary" aria-label="Profit and loss">
+    <div class="card">
+      <div class="hero-label">Net profit and loss</div>
+      <div class="hero-value" id="hero-value">–</div>
+      <div class="hero-sub" id="hero-sub"></div>
+      <div class="hero-sub" id="hero-today"></div>
+      <div class="hero-compare" id="hero-compare"></div>
+    </div>
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+
+  <section class="card" id="sys-card" aria-labelledby="sys-title" hidden>
+    <div class="card-head">
+      <h2 id="sys-title">Systematic runner</h2>
+      <span class="muted small" id="sys-sub"></span>
+    </div>
+    <div class="banner" id="sys-halt" role="alert" hidden></div>
+    <div class="sys-grid">
+      <div>
+        <h3>Strategy</h3>
+        <dl class="sys-kv" id="sys-info"></dl>
+      </div>
+      <div>
+        <h3>Risk controls, last loop</h3>
+        <div class="scroll-x" id="sys-controls"></div>
+      </div>
+    </div>
+    <h3>Targets against holdings</h3>
+    <div class="scroll-x" id="sys-holdings"></div>
+    <h3>Equity and P&amp;L against the backtest replay</h3>
+    <div class="scroll-x" id="sys-compare"></div>
+    <h3>Orders and fills: assumed against actual</h3>
+    <div class="scroll-x" id="sys-fills"></div>
+    <h3>Working and recent orders</h3>
+    <div class="scroll-x" id="sys-orders"></div>
+    <h3>Latest decisions</h3>
+    <div class="scroll-x" id="sys-decisions"></div>
+  </section>
+
+  <div class="grid">
+    <section class="card" aria-labelledby="chart-title">
+      <div class="card-head">
+        <h2 id="chart-title">Duo vs holding BTC</h2>
+        <div class="ranges" id="ranges" role="group" aria-label="Chart time range"></div>
+      </div>
+      <div class="legend" id="legend"></div>
+      <div class="chart-box" id="chart"></div>
+      <details class="table-view" id="chart-table"><summary>Show as a table</summary><div class="scroll-x" id="chart-table-body"></div></details>
+    </section>
+    <div class="stack">
+      <section class="card" aria-labelledby="balances-title">
+        <div class="card-head"><h2 id="balances-title">Balances</h2></div>
+        <div class="scroll-x" id="balances"></div>
+        <div class="prices small" id="prices" aria-label="Current prices"></div>
+      </section>
+      <section class="card" id="limits-card" aria-labelledby="limits-title">
+        <div class="card-head"><h2 id="limits-title">Limits</h2><span class="muted small" id="limits-note">Enforced by code</span></div>
+        <div id="limits"></div>
+      </section>
+    </div>
+  </div>
+
+  <p class="card agents-note" id="agents-note" role="note" hidden></p>
+
+  <div class="grid" id="agent-grid">
+    <section class="card" id="feed-card" aria-labelledby="feed-title">
+      <div class="card-head">
+        <h2 id="feed-title">Conversation</h2>
+        <span class="muted small" id="feed-sub" hidden>Talk only: the agents can't trade in systematic mode</span>
+        <div class="feed-tabs" id="feed-tabs" role="group" aria-label="Which conversations to show">
+          <button type="button" data-kind="decision" aria-pressed="true" title="Opus sessions that can change the portfolio">Decisions</button>
+          <button type="button" data-kind="discussion" aria-pressed="false" title="Haiku discussions every few minutes, which can't change anything">Desk chat</button>
+        </div>
+      </div>
+      <div class="feed" id="feed" tabindex="0" aria-label="Agent conversations"></div>
+    </section>
+    <div class="stack">
+      <section class="card" id="orders-card" aria-labelledby="orders-title">
+        <div class="card-head"><h2 id="orders-title">Waiting orders</h2><span class="muted small" id="orders-stats"></span></div>
+        <div id="orders"></div>
+      </section>
+      <section class="card" id="strategy-card" aria-labelledby="strategy-title">
+        <div class="card-head"><h2 id="strategy-title">Current strategy</h2><span class="muted small" id="strategy-time"></span></div>
+        <div class="strategy-text" id="strategy"></div>
+      </section>
+      <section class="card" id="notes-card" aria-labelledby="notes-title">
+        <div class="card-head"><h2 id="notes-title">Research notes</h2><span class="muted small" id="notes-count"></span></div>
+        <div class="notes" id="notes" tabindex="0" aria-label="Research notes"></div>
+      </section>
+      <section class="card" aria-labelledby="events-title">
+        <div class="card-head"><h2 id="events-title">Activity</h2></div>
+        <div class="events" id="events" tabindex="0" aria-label="Activity log"></div>
+      </section>
+    </div>
+  </div>
+
+  <section class="card" aria-labelledby="trades-title">
+    <div class="card-head">
+      <h2 id="trades-title">Trades</h2>
+      <a class="small" href="/trades.csv">Download CSV</a>
+    </div>
+    <div class="scroll-x" id="trades" tabindex="0" aria-label="Trades table"></div>
+  </section>
+</div>
+
+<dialog id="confirm">
+  <h2>Sell everything?</h2>
+  <p id="confirm-text"></p>
+  <div class="dialog-actions">
+    <button class="btn" type="button" id="confirm-no">Keep positions</button>
+    <button class="btn solid-danger" type="button" id="confirm-yes">Sell everything</button>
+  </div>
+</dialog>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+// All agent and API text goes in through textContent, so it can never run as HTML.
+function h(tag, props = {}, ...children) {
+  const el = document.createElement(tag);
+  for (const [key, value] of Object.entries(props)) {
+    if (value === undefined || value === null || value === false) continue;
+    if (key === "class") el.className = value;
+    else if (key === "text") el.textContent = value;
+    else el.setAttribute(key, value === true ? "" : value);
+  }
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
+    el.append(child);
+  }
+  return el;
+}
+
+function s(tag, attrs = {}, text) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value);
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+
+let quote = "USD";
+const money = (v, digits = 2) => new Intl.NumberFormat(undefined, { style: "currency", currency: quote, currencyDisplay: "narrowSymbol", minimumFractionDigits: digits, maximumFractionDigits: digits }).format(v);
+const usd = (v) => {
+  const digits = v > 0 && v < 0.01 ? 4 : 2;  // A desk chat costs a fraction of a cent, which $0.00 would hide.
+  return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", currencyDisplay: "narrowSymbol", minimumFractionDigits: digits, maximumFractionDigits: digits }).format(v);
+};
+const signed = (v) => (v > 0 ? "+" : v < 0 ? "−" : "") + money(Math.abs(v));
+const signedPct = (v) => (v > 0 ? "+" : v < 0 ? "−" : "") + Math.abs(v).toFixed(2) + "%";
+const tone = (v) => (v > 0.005 ? "up" : v < -0.005 ? "down" : "");
+const qty = (v) => new Intl.NumberFormat(undefined, { maximumFractionDigits: 8 }).format(v);
+const price = (v) => money(v, v < 10 ? 4 : 2);
+const when = (ts) => new Date(ts * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+const clock = (ts) => new Date(ts * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+
+function countdown(seconds) {
+  if (seconds <= 60) return "in under a minute";
+  const total = Math.round(seconds / 60);
+  const hours = Math.floor(total / 60);
+  return hours ? `in ${hours}h ${total % 60}m` : `in ${total}m`;
+}
+
+async function api(path) {
+  const response = await fetch(path, { cache: "no-store" });
+  if (!response.ok) throw new Error(`${path} returned ${response.status}`);
+  return response.json();
+}
+
+async function act(path) {
+  const response = await fetch(path, { method: "POST", headers: { "X-Duo-Action": "1" } });
+  if (!response.ok) throw new Error(`${path} returned ${response.status}`);
+  await refresh();
+  setTimeout(poll, 800);  // The engine acts just after this returns, so look again shortly.
+}
+
+// Only touch the page when the data changed, so open sections and scroll positions survive polling.
+const lastSeen = {};
+function changed(key, value) {
+  const json = JSON.stringify(value);
+  if (lastSeen[key] === json) return false;
+  lastSeen[key] = json;
+  return true;
+}
+
+/* ---- Status and summary ---- */
+
+let current = null;
+
+// Systematic mode: code trades, the agents can't. A server older than this page doesn't send systematic_mode, but
+// it only sends the systematic panel in that mode.
+const isSystematic = (state) => state.systematic_mode ?? !!state.systematic;
+const AGENTS_CANT_TRADE = "In systematic mode the agents can't trade: only the systematic runner's code places orders.";
+
+function renderStatus(state) {
+  const st = state.status;
+  const mode = $("mode");
+  mode.textContent = state.mode === "live" ? "LIVE" : "PAPER";
+  mode.className = state.mode === "live" ? "badge live" : "badge";
+  mode.title = state.mode === "live" ? "Real money" : "Simulated trades at live prices";
+  document.title = state.mode === "live" ? "Duo: LIVE" : "Duo";
+
+  $("status").dataset.code = st.code;
+  let label = st.label;
+  if (st.code === "idle" && st.next_check_in) {
+    const left = st.next_check_in - state.now;
+    const decision = left > 0 ? `Next decision ${countdown(left)}.` : "A decision is due.";
+    const desk = st.next_discussion ? st.next_discussion - state.now : null;
+    label = desk === null ? `The agents are asleep. ${decision}` : `Next desk chat ${desk > 0 ? countdown(desk) : "shortly"}. ${decision}`;
+  }
+  const sysMode = isSystematic(state);
+  if (st.agents_error && st.code !== "halted") {
+    label += sysMode ? ` Last desk chat failed (the agents can't trade): ${st.agents_error}` : ` Last session failed: ${st.agents_error}`;
+  }
+  $("status-text").textContent = label;
+
+  const wake = $("wake");
+  wake.hidden = sysMode;  // Decision sessions exist to trade, and in systematic mode the agents can't.
+  wake.disabled = st.running || st.halted || !st.agents_ready;
+  const halt = $("halt");
+  halt.textContent = st.halted ? "Resume trading" : "Stop trading";
+  halt.title = sysMode
+    ? (st.halted
+      ? "Lets the systematic runner trade again and resets its drawdown peak to current equity."
+      : "Pauses the systematic runner: every order is cancelled and nothing new is placed until you resume. The kill switch stays armed.")
+    : st.halted
+      ? "Lets the agents trade again and resets the drawdown peak to current equity."
+      : "Stops the agents and any new trades. Stop-losses stay armed.";
+  $("flatten").disabled = st.flattening;
+  $("flatten").textContent = st.flattening ? "Selling…" : "Sell everything";
+}
+
+function renderSummary(state) {
+  const m = state.metrics;
+  if (!m) return;
+  const hero = $("hero-value");
+  hero.textContent = signed(m.net_pnl);
+  hero.className = `hero-value ${tone(m.net_pnl)}`;
+  $("hero-sub").textContent = `${signedPct(m.net_pnl_pct)} on ${money(m.starting)}, after ${money(m.fees)} in fees and ${money(m.api_cost)} in API costs`;
+  const days = m.finished_days ? ` Profitable days so far: ${m.profitable_days} of ${m.finished_days}.` : "";
+  $("hero-today").textContent = `Today: ${signed(m.today_pnl)}.${days}`;
+  const gap = m.vs_benchmark;
+  const verdict = Math.abs(gap) < 0.005 ? "level with it" : gap > 0 ? `${money(gap)} ahead` : `${money(-gap)} behind`;
+  $("hero-compare").textContent = `Holding BTC instead would be ${signed(m.benchmark_pnl)}. Duo is ${verdict}.`;
+
+  const tiles = [
+    ["Equity", money(m.equity), ""],
+    ["Cash", money(m.cash), ""],
+    ["Realized P&L", signed(m.realized), tone(m.realized)],
+    ["Unrealized P&L", signed(m.unrealized), tone(m.unrealized)],
+    ["Fees paid", money(m.fees), ""],
+    ["API costs", money(m.api_cost), ""],
+  ];
+  $("tiles").replaceChildren(...tiles.map(([label, value, cls]) =>
+    h("div", { class: "card tile" },
+      h("div", { class: "tile-label", text: label }),
+      h("div", { class: `tile-value ${cls}`, text: value }))));
+}
+
+function renderBalances(state) {
+  const rows = state.balances;
+  if (!rows) return;
+  $("balances").replaceChildren(h("table", {},
+    h("thead", {}, h("tr", {},
+      h("th", { text: "Asset" }), h("th", { class: "num", text: "Value" }), h("th", { class: "num", text: "Unrealized" }))),
+    h("tbody", {}, rows.map((row) => h("tr", {},
+      h("td", {},
+        h("span", { class: "asset", text: row.asset }),
+        h("span", { class: "sub", text: row.cash ? "Cash" : qty(row.qty) })),
+      h("td", { class: "num" },
+        money(row.value),
+        h("span", { class: "sub", text: `${row.share_pct.toFixed(1)}%` })),
+      h("td", { class: "num" },
+        row.cash ? h("span", { class: "muted", text: "–" }) : h("span", { class: tone(row.unrealized), text: signed(row.unrealized) }),
+        row.cash ? null : h("span", { class: "sub", text: row.stop ? `Stop ${money(row.stop, row.stop < 100 ? 2 : 0)}` : "No stop" }),
+        row.cash || !row.target ? null : h("span", { class: "sub", text: `Target ${money(row.target, row.target < 100 ? 2 : 0)}` })))))));
+  $("prices").replaceChildren(...(state.prices || []).map((row) =>
+    h("span", {}, h("span", { class: "muted", text: `${row.asset} ` }), price(row.mid))));
+}
+
+function renderLimits(state) {
+  // In systematic mode the box shows the runner's own [systematic] limits. A server older than this page still sends
+  // the agents' [risk] limits there, which don't apply, so the box hides and the runner's risk-controls table stands.
+  const wrongKind = isSystematic(state) && state.limits_kind !== "systematic";
+  $("limits-card").hidden = wrongKind;
+  if (state.limits_note) $("limits-note").textContent = state.limits_note;
+  const limits = state.limits;
+  if (!limits || wrongKind) return;
+  const fmt = (limit, value) => limit.unit === "pct" ? `${value.toFixed(1)}%` : limit.unit === "usd" ? usd(value)
+    : limit.unit === "minutes" ? `${value.toFixed(0)} min` : limit.unit === "seconds" ? `${value.toFixed(0)}s` : String(value);
+  $("limits").replaceChildren(...limits.map((limit) => {
+    const note = limit.note ? h("div", { class: "limit-note", text: limit.note }) : null;
+    if (limit.unit === "rule") {
+      return h("div", { class: "limit" }, h("div", { class: "limit-top" }, h("span", { text: limit.label }), h("b", { text: limit.text })), note);
+    }
+    // Unknown means the runner couldn't take the reading, and it fails closed on that.
+    const known = limit.used != null && limit.max != null;
+    const ratio = known && limit.max > 0 ? Math.max(Math.min(limit.used / limit.max, 1), 0) : 0;
+    const level = !known ? "warn" : ratio >= 1 ? "critical" : ratio >= 0.8 ? "warn" : "";
+    const reading = known ? `${fmt(limit, limit.used)} of ${fmt(limit, limit.max)}`
+      : limit.max != null ? `unknown, limit ${fmt(limit, limit.max)}` : "unknown";
+    return h("div", { class: "limit" },
+      h("div", { class: "limit-top" }, h("span", { text: limit.label }), h("b", { text: reading })),
+      h("div", { class: "meter", role: "img", "aria-label": `${limit.label}: ${reading}` },
+        (() => { const bar = h("i", { class: level }); bar.style.width = `${(known ? ratio * 100 : 100).toFixed(1)}%`; return bar; })()),
+      note);
+  }));
+}
+
+function renderAgents(state) {
+  const sysMode = isSystematic(state);
+  const agents = state.agents || { enabled: !sysMode, can_trade: !sysMode, talking: !!state.status.agents_ready, label: "" };
+  // In systematic mode the agents' panels go, unless their discussions are switched on, and then only the desk chat
+  // and its notes show, labelled as unable to trade. Decisions, waiting orders and the strategy belong to agent trading.
+  const chat = !sysMode || agents.enabled;
+  const note = $("agents-note");
+  note.hidden = !sysMode;
+  note.textContent = sysMode ? (agents.label || AGENTS_CANT_TRADE) : "";
+  $("feed-card").hidden = !chat;
+  $("notes-card").hidden = !chat;
+  $("orders-card").hidden = sysMode;
+  $("strategy-card").hidden = sysMode;
+  $("agent-grid").classList.toggle("solo", !chat);
+  $("feed-title").textContent = sysMode ? "Desk chat" : "Conversation";
+  $("feed-tabs").hidden = sysMode;
+  $("feed-sub").hidden = !sysMode;
+  if (sysMode && feedKind !== "discussion") {
+    feedKind = "discussion";
+    delete lastSeen.sessions;
+  }
+  return chat;
+}
+
+function renderStrategy(state) {
+  if (!changed("strategy", state.strategy)) return;
+  const box = $("strategy");
+  if (state.strategy) {
+    box.textContent = state.strategy.text;
+    box.classList.remove("muted");
+    $("strategy-time").textContent = `Updated ${when(state.strategy.ts)}`;
+  } else {
+    box.textContent = "None yet. The agents write one in their first session.";
+    box.classList.add("muted");
+    $("strategy-time").textContent = "";
+  }
+}
+
+function timeLeft(seconds) {
+  if (seconds <= 0) return "ending";
+  const minutes = Math.ceil(seconds / 60);
+  return minutes < 90 ? `${minutes} min left` : `${Math.round(minutes / 60)}h left`;
+}
+
+function renderOrders(orders) {
+  const stats = orders.stats;
+  $("orders-stats").textContent = stats.closed
+    ? `Resting: ${stats.filled} of ${stats.closed} filled, ${money(stats.fees_saved)} saved`
+    : "";
+  const rows = [];
+  for (const plan of orders.plans) {
+    const verb = plan.direction === "below" ? "falls to" : "rises to";
+    const cancel = h("button", { class: "btn btn-small", type: "button", text: "Cancel", "aria-label": `Cancel plan ${plan.id}` });
+    cancel.addEventListener("click", guarded(() => act(`/api/plans/${plan.id}/cancel`)));
+    const state = plan.status === "working"
+      ? "Triggered, order in the book"
+      : plan.away_pct != null ? `${plan.away_pct.toFixed(1)}% away` : "";
+    rows.push(h("div", { class: "order-row" },
+      h("div", { class: "order-main" },
+        h("b", { text: `Buy ${plan.asset}` }), `: ${money(plan.amount)} if it ${verb} ${price(plan.trigger)}`,
+        h("span", { class: "order-sub", text: [state, plan.execution === "resting" ? "Resting" : "Immediate", timeLeft(plan.seconds_left)].filter(Boolean).join(" · ") }),
+        h("span", { class: "order-sub", text: `Stop ${price(plan.stop)} · Target ${price(plan.target)}` }),
+        plan.note ? h("span", { class: "blocked small", text: `Blocked: ${plan.note}` }) : null),
+      cancel));
+  }
+  for (const order of orders.resting) {
+    const label = order.source === "target" ? "Profit target sell" : order.side === "buy" ? "Resting buy" : "Resting sell";
+    rows.push(h("div", { class: "order-row" },
+      h("div", { class: "order-main" },
+        h("b", { text: `${label} ${order.asset}` }), `: ${qty(order.qty)} at ${price(order.limit)}`,
+        h("span", { class: "order-sub", text: [`${order.filled_pct.toFixed(0)}% filled`, timeLeft(order.seconds_left)].join(" · ") }))));
+  }
+  $("orders").replaceChildren(...(rows.length ? rows : [h("p", { class: "empty", text: "Nothing waiting." })]));
+}
+
+/* ---- Equity chart ---- */
+
+let chartRange = "7d";
+let chartData = { points: [], starting: 0 };
+let hoverIndex = null;
+
+const SERIES = [
+  { key: "equity", label: "Duo", color: "var(--series-1)" },
+  { key: "benchmark", label: "Hold BTC", color: "var(--series-2)" },
+];
+
+$("legend").replaceChildren(...SERIES.map((series) => {
+  const key = h("span", { class: "key" });
+  key.style.background = series.color;
+  return h("span", { class: "legend-item" }, key, series.label);
+}));
+
+const RANGES = [["24h", "24h"], ["7d", "7 days"], ["30d", "30 days"], ["all", "All"]];
+$("ranges").replaceChildren(...RANGES.map(([value, label]) => {
+  const button = h("button", { type: "button", text: label, "aria-pressed": String(value === chartRange) });
+  button.addEventListener("click", async () => {
+    chartRange = value;
+    for (const other of $("ranges").children) other.setAttribute("aria-pressed", String(other === button));
+    await refreshChart();
+  });
+  return button;
+}));
+
+function niceTicks(low, high, count = 4) {
+  const span = high - low || 1;
+  const rough = span / count;
+  const magnitude = 10 ** Math.floor(Math.log10(rough));
+  const step = [1, 2, 2.5, 5, 10].map((n) => n * magnitude).find((n) => n >= rough);
+  const ticks = [];
+  for (let v = Math.ceil(low / step) * step; v <= high + step * 1e-6; v += step) ticks.push(Number(v.toFixed(8)));
+  return ticks;
+}
+
+function drawChart() {
+  const box = $("chart");
+  const { points, starting } = chartData;
+  box.replaceChildren();
+  if (points.length < 2) {
+    box.append(h("p", { class: "empty", text: "The chart starts once there are two data points, about five minutes after the bot starts." }));
+    return;
+  }
+
+  const width = Math.max(box.clientWidth, 280);
+  const height = width < 520 ? 220 : 290;
+  const narrow = width < 620;
+  const margin = { top: 12, right: narrow ? 8 : 112, bottom: 26, left: 62 };
+  const plotW = width - margin.left - margin.right;
+  const plotH = height - margin.top - margin.bottom;
+
+  const values = points.flatMap((p) => [p.equity, p.benchmark]).concat(starting);
+  let low = Math.min(...values), high = Math.max(...values);
+  const pad = Math.max((high - low) * 0.12, starting * 0.002);
+  low -= pad; high += pad;
+  const t0 = points[0].ts, t1 = points[points.length - 1].ts;
+  const x = (t) => margin.left + ((t - t0) / (t1 - t0 || 1)) * plotW;
+  const y = (v) => margin.top + (1 - (v - low) / (high - low)) * plotH;
+
+  const svg = s("svg", {
+    viewBox: `0 0 ${width} ${height}`, height, tabindex: 0, role: "img",
+    "aria-label": `Equity compared with holding BTC. Latest: Duo ${money(points.at(-1).equity)}, holding BTC ${money(points.at(-1).benchmark)}. A table view is available below.`,
+  });
+
+  const digits = high - low < 20 ? 2 : 0;
+  for (const tick of niceTicks(low, high)) {
+    svg.append(s("line", { x1: margin.left, x2: width - margin.right, y1: y(tick), y2: y(tick), stroke: "var(--grid)", "stroke-width": 1 }));
+    svg.append(s("text", { x: margin.left - 8, y: y(tick) + 4, "text-anchor": "end", class: "tick" }, money(tick, digits)));
+  }
+
+  const spanHours = (t1 - t0) / 3600;
+  const xCount = narrow ? 3 : 6;
+  const seen = new Set();
+  for (let i = 0; i <= xCount; i++) {
+    const t = t0 + ((t1 - t0) * i) / xCount;
+    const date = new Date(t * 1000);
+    const label = spanHours <= 36
+      ? date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+      : date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    if (seen.has(label)) continue;  // A short span would otherwise repeat the same time.
+    seen.add(label);
+    const anchor = i === 0 ? "start" : i === xCount ? "end" : "middle";
+    svg.append(s("text", { x: x(t), y: height - 8, "text-anchor": anchor, class: "tick" }, label));
+  }
+
+  svg.append(s("line", { x1: margin.left, x2: width - margin.right, y1: y(starting), y2: y(starting), stroke: "var(--baseline)", "stroke-width": 1 }));
+
+  for (const series of [...SERIES].reverse()) {
+    const d = points.map((p, i) => `${i ? "L" : "M"}${x(p.ts).toFixed(1)},${y(p[series.key]).toFixed(1)}`).join("");
+    svg.append(s("path", { d, fill: "none", stroke: series.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+  }
+
+  const last = points.at(-1);
+  const endYs = SERIES.map((series) => y(last[series.key]));
+  const labelsFit = !narrow && Math.abs(endYs[0] - endYs[1]) >= 16;
+  SERIES.forEach((series, i) => {
+    svg.append(s("circle", { cx: x(last.ts), cy: endYs[i], r: 4, fill: series.color, stroke: "var(--surface)", "stroke-width": 2 }));
+    if (labelsFit) {
+      svg.append(s("text", { x: x(last.ts) + 10, y: endYs[i] + 4, class: "end-label" }, `${series.label} ${money(last[series.key], 0)}`));
+    }
+  });
+
+  const cross = s("line", { y1: margin.top, y2: height - margin.bottom, stroke: "var(--baseline)", "stroke-width": 1, visibility: "hidden" });
+  svg.append(cross);
+  const markers = SERIES.map((series) => {
+    const dot = s("circle", { r: 4, fill: series.color, stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden" });
+    svg.append(dot);
+    return dot;
+  });
+
+  const tip = h("div", { class: "tip", hidden: true });
+  box.append(svg, tip);
+
+  const show = (index) => {
+    hoverIndex = index;
+    const p = points[index];
+    const cx = x(p.ts);
+    cross.setAttribute("x1", cx); cross.setAttribute("x2", cx); cross.setAttribute("visibility", "visible");
+    markers.forEach((dot, i) => {
+      dot.setAttribute("cx", cx); dot.setAttribute("cy", y(p[SERIES[i].key])); dot.setAttribute("visibility", "visible");
+    });
+    tip.replaceChildren(
+      h("div", { class: "tip-time", text: when(p.ts) }),
+      ...SERIES.map((series) => {
+        const key = h("span", { class: "key" });
+        key.style.background = series.color;
+        return h("div", { class: "tip-row" }, key, h("b", { text: money(p[series.key]) }), h("span", { text: series.label }));
+      }));
+    tip.hidden = false;
+    const tipWidth = tip.offsetWidth;
+    tip.style.left = `${cx + 12 + tipWidth > width ? Math.max(cx - tipWidth - 12, 0) : cx + 12}px`;
+  };
+  const hide = () => {
+    hoverIndex = null;
+    tip.hidden = true;
+    cross.setAttribute("visibility", "hidden");
+    markers.forEach((dot) => dot.setAttribute("visibility", "hidden"));
+  };
+  const nearest = (clientX) => {
+    const rect = svg.getBoundingClientRect();
+    const t = t0 + ((clientX - rect.left - margin.left) / plotW) * (t1 - t0);
+    let best = 0;
+    points.forEach((p, i) => { if (Math.abs(p.ts - t) < Math.abs(points[best].ts - t)) best = i; });
+    return best;
+  };
+  svg.addEventListener("pointermove", (event) => show(nearest(event.clientX)));
+  svg.addEventListener("pointerdown", (event) => show(nearest(event.clientX)));
+  svg.addEventListener("pointerleave", hide);
+  svg.addEventListener("blur", hide);
+  svg.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      const start = hoverIndex ?? points.length - 1;
+      show(Math.max(0, Math.min(points.length - 1, start + (event.key === "ArrowLeft" ? -1 : 1))));
+    } else if (event.key === "Escape") hide();
+  });
+}
+
+function renderChartTable() {
+  const rows = chartData.points.slice(-60).reverse();
+  $("chart-table-body").replaceChildren(h("table", {},
+    h("thead", {}, h("tr", {}, h("th", { text: "Time" }), h("th", { class: "num", text: "Duo" }), h("th", { class: "num", text: "Hold BTC" }))),
+    h("tbody", {}, rows.map((p) => h("tr", {},
+      h("td", { text: when(p.ts) }), h("td", { class: "num", text: money(p.equity) }), h("td", { class: "num", text: money(p.benchmark) }))))));
+}
+
+async function refreshChart() {
+  chartData = await api(`/api/equity?range=${chartRange}`);
+  if (hoverIndex === null) {
+    drawChart();
+    renderChartTable();
+  }
+}
+
+let resizeTimer;
+new ResizeObserver(() => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(drawChart, 80);
+}).observe($("chart"));
+
+/* ---- Conversation ---- */
+
+const OUTCOMES = {
+  discussed: ["Discussed", ""], flagged: ["Asked for a decision", "warn"],
+  traded: ["Traded", "good"], approved: ["Approved", "good"], held: ["Held", ""],
+  rejected: ["Rejected", "bad"], no_agreement: ["No agreement", "warn"], failed: ["Failed", "bad"],
+  budget: ["Budget limit", "warn"], interrupted: ["Interrupted", "warn"],
+};
+const VERDICTS = { approve: ["Approved", "good"], revise: ["Wants changes", "warn"], reject: ["Rejected", "bad"], escalate: ["Asks for a decision", "warn"] };
+const SPEAKERS = { strategist: ["S", "Strategist"], risk: ["R", "Risk Manager"] };
+
+const sessionOpen = new Map();
+const reasoningOpen = new Set();
+
+function orderLine(order) {
+  const side = order.side === "buy" ? "Buy" : "Sell";
+  const detail = (order.side === "buy"
+    ? `spend ${order.quote_amount != null ? money(order.quote_amount) : "?"}, stop ${order.stop_price != null ? price(order.stop_price) : "none"}, target ${order.target_price != null ? price(order.target_price) : "none"}`
+    : `${order.sell_fraction != null ? Math.round(order.sell_fraction * 100) : "?"}% of the position`)
+    + (order.trigger_price != null ? `, when the price reaches ${price(order.trigger_price)}` : "")
+    + `, ${order.execution || "immediate"}`;
+  return h("div", { class: "proposal-item" },
+    h("b", { text: `${side} ${order.asset}` }), `: ${detail}`,
+    order.reason ? h("div", { class: "muted small", text: order.reason }) : null,
+    order.blocked ? h("span", { class: "blocked", text: `Blocked by the limits: ${order.blocked}` }) : null);
+}
+
+function renderMessage(message) {
+  if (message.speaker === "system") {
+    return h("div", { class: "msg-note", text: message.text });
+  }
+  const [initial, name] = SPEAKERS[message.speaker] || ["?", message.speaker];
+  const proposal = message.proposal;
+  const tools = message.tools.length ? `Looked at ${message.tools.join(", ")}` : null;
+  let verdict = message.verdict ? VERDICTS[message.verdict] : null;
+  // No decision session runs in systematic mode, so a flag asks for nothing.
+  if (message.verdict === "escalate" && current && isSystematic(current)) verdict = ["Flagged (no decision runs in this mode)", "warn"];
+  let reasoning = null;
+  if (message.reasoning) {
+    reasoning = h("details", { class: "reasoning", open: reasoningOpen.has(message.id) },
+      h("summary", { text: "Reasoning summary" }), h("p", { text: message.reasoning }));
+    reasoning.addEventListener("toggle", () => {
+      if (reasoning.open) reasoningOpen.add(message.id); else reasoningOpen.delete(message.id);
+    });
+  }
+  return h("article", { class: "msg" },
+    h("div", { class: `avatar ${message.speaker}`, "aria-hidden": "true", text: initial }),
+    h("div", {},
+      h("div", { class: "msg-head" },
+        h("span", { class: "msg-name", text: name }),
+        verdict ? h("span", { class: `chip ${verdict[1]}`, text: verdict[0] }) : null,
+        h("span", { class: "muted small", text: clock(message.ts) })),
+      h("div", { class: "msg-text", text: message.text }),
+      proposal ? h("div", { class: "proposal" },
+        current && isSystematic(current) ? h("div", { class: "muted small", text: "A suggestion only. The agents can't trade in systematic mode." }) : null,
+        (proposal.orders || []).map(orderLine),
+        (proposal.stops || []).map((stop) => h("div", { class: "proposal-item" },
+          h("b", { text: `Move ${stop.asset} stop` }), ` to ${price(stop.stop_price)}`,
+          stop.target_price != null ? `, target to ${price(stop.target_price)}` : null,
+          stop.blocked ? h("span", { class: "blocked", text: `Blocked by the limits: ${stop.blocked}` }) : null)),
+        (proposal.cancel_plans || []).map((id) => h("div", { class: "proposal-item", text: `Cancel plan ${id}` })),
+        proposal.strategy_changed ? h("div", { class: "proposal-item", text: "Proposes a new strategy" }) : null) : null,
+      tools ? h("div", { class: "muted small", style: "margin-top:6px", text: tools }) : null,
+      reasoning));
+}
+
+function renderSessions(sessions, state) {
+  const feed = $("feed");
+  const sysMode = !!state && isSystematic(state);
+  if (!sessions.length && sysMode) {
+    const talking = state.agents ? state.agents.talking : state.status.agents_ready;
+    feed.replaceChildren(h("p", { class: "empty", text: talking
+      ? "No desk chat yet. It starts within a few minutes. The agents can't trade in this mode."
+      : "No desk chat. Agent discussions are switched on, but they start only once ANTHROPIC_API_KEY is in .env and the bot has restarted." }));
+    return;
+  }
+  if (!sessions.length) {
+    const ready = state && state.status.agents_ready;
+    feed.replaceChildren(h("p", { class: "empty", text: ready
+      ? (feedKind === "discussion" ? "No desk chat yet. It starts within a few minutes." : "No sessions yet. The first one starts shortly.")
+      : "No sessions yet. The agents start talking once ANTHROPIC_API_KEY is in .env and the bot has restarted." }));
+    return;
+  }
+  const scroll = feed.scrollTop;
+  feed.replaceChildren(...sessions.map((session, index) => {
+    const running = session.ended_at === null;
+    let [label, cls] = running ? ["In progress", "active"] : (OUTCOMES[session.outcome] || [session.outcome, ""]);
+    if (sysMode && session.outcome === "flagged") label = "Flagged, but no decision runs in this mode";
+    const open = sessionOpen.has(session.id) ? sessionOpen.get(session.id) : index === 0;
+    const details = h("details", { class: "session", open },
+      h("summary", {},
+        h("span", { class: "session-title", text: session.kind === "discussion" ? `Desk chat ${session.id}` : `Session ${session.id}: ${session.trigger}` }),
+        h("span", { class: `chip ${cls}`, text: label }),
+        h("span", { class: "session-meta", text: `${when(session.started_at)} · ${usd(session.cost_usd)} in API costs` }),
+        session.summary ? h("span", { class: "session-summary", text: session.summary }) : null),
+      h("div", { class: "session-body" },
+        session.messages.length ? session.messages.map(renderMessage) : h("p", { class: "muted", text: "Waiting for the Strategist…" })));
+    details.addEventListener("toggle", () => sessionOpen.set(session.id, details.open));
+    return details;
+  }));
+  feed.scrollTop = scroll;
+}
+
+function renderNotes(state) {
+  const box = $("notes");
+  $("notes-count").textContent = state.rule_tests ? `${state.rule_tests} rule ${state.rule_tests === 1 ? "test" : "tests"} so far` : "";
+  box.replaceChildren(...(state.notes.length
+    ? state.notes.map((note) => h("div", { class: "note" }, h("time", { text: when(note.ts) }), note.text))
+    : [h("p", { class: "empty", text: "Nothing yet. The agents record what they learn here." })]));
+}
+
+let feedKind = "decision";
+for (const button of $("feed-tabs").children) {
+  button.addEventListener("click", guarded(async () => {
+    feedKind = button.dataset.kind;
+    for (const other of $("feed-tabs").children) other.setAttribute("aria-pressed", String(other === button));
+    delete lastSeen.sessions;
+    await refresh();
+  }));
+}
+
+/* ---- Trades and activity ---- */
+
+const SOURCES = { agents: "Agents", plan: "Plan", stop: "Stop-loss", target: "Profit target", flatten: "Sell everything", systematic: "Systematic runner" };
+
+function renderTrades(trades) {
+  const box = $("trades");
+  if (!trades.length) {
+    box.replaceChildren(h("p", { class: "empty", text: "No trades yet." }));
+    return;
+  }
+  box.replaceChildren(h("table", {},
+    h("thead", {}, h("tr", {},
+      h("th", { text: "Time" }), h("th", { text: "Trade" }), h("th", { text: "Order" }),
+      h("th", { class: "num", text: "Amount" }), h("th", { class: "num", text: "Price" }), h("th", { class: "num", text: "Value" }),
+      h("th", { class: "num", text: "Fee" }), h("th", { class: "num", text: "Realized" }),
+      h("th", { text: "Triggered by" }), h("th", { text: "Reason" }))),
+    h("tbody", {}, trades.map((t) => h("tr", {},
+      h("td", { style: "white-space:nowrap", text: when(t.ts) }),
+      h("td", { style: "white-space:nowrap" }, h("span", { class: "side", text: t.side === "buy" ? "Buy" : "Sell" }), ` ${t.asset}`),
+      h("td", { text: t.liquidity === "maker" ? "Resting" : "Immediate" }),
+      h("td", { class: "num", text: qty(t.qty) }),
+      h("td", { class: "num", text: price(t.price) }),
+      h("td", { class: "num", text: money(t.gross) }),
+      h("td", { class: "num", text: money(t.fee) }),
+      h("td", { class: "num" }, t.side === "sell" ? h("span", { class: tone(t.realized), text: signed(t.realized) }) : h("span", { class: "muted", text: "–" })),
+      h("td", { style: "white-space:nowrap", text: t.session_id ? `${SOURCES[t.source] || t.source}, session ${t.session_id}` : (SOURCES[t.source] || t.source) }),
+      h("td", { class: "reason", text: t.reason || "" }))))));
+}
+
+function renderEvents(events) {
+  const box = $("events");
+  if (!events.length) {
+    box.replaceChildren(h("p", { class: "empty", text: "Nothing yet." }));
+    return;
+  }
+  box.replaceChildren(...events.map((event) => h("div", { class: `event ${event.level}` },
+    h("time", { text: when(event.ts) }), event.text)));
+}
+
+
+/* ---- Systematic runner ---- */
+
+const pct = (v, digits = 2) => v == null ? "–" : `${(v * 100).toFixed(digits)}%`;
+const utcTime = (ts) => ts == null ? "–" : new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+const fixed = (v, digits = 1) => v == null ? "–" : Number(v).toFixed(digits);
+
+function table(head, rows) {
+  return h("table", {}, h("thead", {}, h("tr", {}, head.map((label) => h("th", { text: label })))),
+    h("tbody", {}, rows.length ? rows.map((cells) => h("tr", {}, cells.map((cell) =>
+      cell instanceof Node ? h("td", {}, cell) : h("td", { text: cell == null ? "–" : String(cell) }))))
+      : h("tr", {}, h("td", { colspan: head.length, class: "muted", text: "Nothing yet." }))));
+}
+
+function renderSystematic(state) {
+  const sys = state.systematic;
+  $("sys-card").hidden = !sys;
+  if (!sys) return;
+  const halts = sys.halts;
+  $("sys-sub").textContent = `Paper only. Decides once a day after 00:00 UTC + settle, checks every loop.`;
+  const halt = $("sys-halt");
+  if (halts.kill) {
+    halt.replaceChildren(h("span", { text: `Halted: ${halts.kill_reason}. ${sys.how_to_resume} ` }),
+      h("button", { class: "btn btn-small", type: "button", id: "sys-resume", text: "Resume" }));
+    $("sys-resume").addEventListener("click", guarded(() => act("/api/resume")));
+    halt.hidden = false;
+  } else {
+    halt.hidden = true;
+  }
+  const hb = sys.heartbeat;
+  const start = sys.start || {};
+  const other = [];
+  if (halts.daily_loss === null || halts.daily_loss) other.push("no buys today (daily loss)");
+  if (halts.signal_stale) other.push("daily bar missing");
+  if (halts.api_errors) other.push(`${halts.api_errors} API errors in a row`);
+  if (halts.waiting) other.push(halts.waiting);
+  const info = [
+    ["Strategy", sys.strategy], ["Family", sys.family],
+    ["Paper capital", `${start.starting_capital} ${start.quote} (GBP ${start.starting_capital_gbp} at GBP/USD ${start.gbp_usd})`],
+    ["Fees", `${start.maker_pct}% maker, ${start.taker_pct}% taker`],
+    ["Equity", sys.equity == null ? "unknown" : money(sys.equity)],
+    ["Next decision", utcTime(sys.next_decision)],
+    ["Last loop", hb ? `${utcTime(hb.ts)}, ${hb.status}` : "not yet"],
+    ["Other halts", other.length ? other.join("; ") : "none"],
+    ["Research code", (start.research_code_sha256 || "").slice(0, 16)],
+  ];
+  $("sys-info").replaceChildren(...info.flatMap(([k, v]) => [h("dt", { text: k }), h("dd", { text: v })]));
+  $("sys-controls").replaceChildren(table(["Control", "Value", "Threshold", "Outcome", "Detail"],
+    (sys.controls || []).map((c) => [c.control, fixed(c.value, 2), fixed(c.threshold, 2),
+      h("span", { class: c.outcome === "pass" ? "pass" : "fail", text: c.outcome }), c.detail || ""])));
+  $("sys-holdings").replaceChildren(table(["Asset", "Research column", "Target", "Holding", "Limit", "Quantity", "Value"],
+    (sys.holdings || []).map((r) => [r.asset, r.column, r.tranche ? `DCA ${money(+r.tranche)}` : pct(r.target),
+      pct(r.weight), pct(sys.asset_limits[r.asset]), r.qty == null ? "–" : qty(r.qty), r.value == null ? "–" : money(r.value)])));
+  const cmp = sys.compare || {};
+  const sm = cmp.summary || {};
+  const summary = cmp.error ? [h("p", { class: "fail", text: `Compare failed: ${cmp.error}` })] : [
+    h("p", { class: "small", text: `${sm.days || 0} finished day(s). Paper ${pct(sm.paper_total)} against backtest ${pct(sm.backtest_total)}. ` +
+      `Mean daily difference ${pct(sm.mean_difference, 3)}, tracking error ${pct(sm.tracking_error_annual)} a year. ` +
+      `Maker fills: ${pct(sm.maker_share, 0)} of ${sm.fills || 0}.` }),
+    ...(cmp.notes || []).map((n) => h("p", { class: "small muted", text: n }))];
+  $("sys-compare").replaceChildren(...summary, table(["Day", "Paper", "Backtest", "Difference", "Paper cumulative", "Backtest cumulative", "Paper equity"],
+    (cmp.days || []).slice().reverse().map((d) => [d.day, pct(d.paper, 3), pct(d.backtest, 3), pct(d.difference, 3),
+      pct(d.paper_cumulative), pct(d.backtest_cumulative), money(d.paper_equity)])));
+  $("sys-fills").replaceChildren(table(["Order", "Side", "Asset", "Notional", "Assumed open", "Assumed cost bps", "Paper price", "Paper fee", "Paper cost bps", "Gap bps", "Maker"],
+    (cmp.orders || []).slice().reverse().map((o) => [o.order, o.side, o.asset, money(o.notional), o.assumed_open == null ? "pending" : price(o.assumed_open),
+      fixed(o.assumed_cost_bps), price(o.paper_price), money(o.paper_fee), fixed(o.paper_cost_bps), fixed(o.gap_bps), pct(o.maker_share, 0)])));
+  $("sys-orders").replaceChildren(table(["Order", "Created", "Side", "Asset", "Status", "Filled", "Children", "Note"],
+    (sys.orders || []).map((o) => [o.id, utcTime(o.created_at), o.side, o.asset, o.status,
+      o.side === "buy" ? money(+o.filled_gross) : qty(+o.filled_qty),
+      o.children.map((c) => `${c.kind} ${c.status} @ ${c.limit_price}`).join(", "), o.note || ""])));
+  $("sys-decisions").replaceChildren(table(["Bar", "Decided", "Equity", "Orders", "Controls failing", "Left in cash", "Notes"],
+    (sys.decisions || []).map((d) => [d.bar.slice(0, 10), utcTime(d.decided_at), d.equity == null ? "–" : money(d.equity),
+      d.intended.map((i) => `${i.side} ${i.asset}`).join(", ") || "none",
+      d.risk.filter((c) => c.outcome !== "pass").map((c) => c.control).join(", ") || "none",
+      d.untradable.map((u) => `${u.column}: ${u.reason}`).join("; ") || "none", d.notes || ""])));
+}
+
+/* ---- Polling and actions ---- */
+
+async function refresh() {
+  const state = await api("/api/state");
+  current = state;
+  quote = state.quote;
+  renderStatus(state);
+  if (changed("summary", state.metrics)) renderSummary(state);
+  if (changed("balances", [state.balances, state.prices])) renderBalances(state);
+  if (changed("limits", [state.limits, state.limits_kind, state.limits_note, isSystematic(state)])) renderLimits(state);
+  if (changed("systematic", state.systematic)) renderSystematic(state);
+  const chat = renderAgents(state);
+  renderStrategy(state);
+  // Rounded so the list only redraws when what it shows changes, which keeps Cancel buttons clickable.
+  const orderView = { ...state.orders,
+    plans: state.orders.plans.map((p) => ({ ...p, seconds_left: Math.ceil(p.seconds_left / 60) * 60, away_pct: p.away_pct == null ? null : +p.away_pct.toFixed(1) })),
+    resting: state.orders.resting.map((o) => ({ ...o, seconds_left: Math.ceil(o.seconds_left / 60) * 60 })) };
+  if (changed("orders", orderView)) renderOrders(orderView);
+  if (changed("notes", [state.notes, state.rule_tests])) renderNotes(state);
+  // With the agents off there's no conversation to fetch.
+  const [sessions, trades, events] = await Promise.all([chat ? api(`/api/sessions?kind=${feedKind}`) : null, api("/api/trades"), api("/api/events")]);
+  if (sessions && changed("sessions", sessions)) renderSessions(sessions, state);
+  if (changed("trades", trades)) renderTrades(trades);
+  if (changed("events", events)) renderEvents(events);
+}
+
+async function poll() {
+  try {
+    await refresh();
+    await refreshChart();
+    $("banner").hidden = true;
+  } catch (error) {
+    $("banner").textContent = "Can't reach the bot. It may have stopped, and no stop-losses run while it's stopped.";
+    $("banner").hidden = false;
+  }
+}
+
+function guarded(handler) {
+  return async () => {
+    try {
+      await handler();
+    } catch (error) {
+      $("banner").textContent = `That didn't work: ${error.message}`;
+      $("banner").hidden = false;
+    }
+  };
+}
+
+$("wake").addEventListener("click", guarded(() => act("/api/wake")));
+$("halt").addEventListener("click", guarded(() => act(current && current.status.halted ? "/api/resume" : "/api/halt")));
+$("flatten").addEventListener("click", () => {
+  const live = current && current.mode === "live";
+  $("confirm-text").textContent = current && isSystematic(current)
+    ? "This cancels every order, sells everything in the paper portfolio at market (capped), then halts the systematic runner. You can resume it later."
+    : (live
+    ? "This places real sell orders on Kraken for everything the bot holds, then stops agent trading."
+    : "This sells everything in the paper portfolio, then stops agent trading.") + " You can resume trading later.";
+  $("confirm").showModal();
+});
+$("confirm-no").addEventListener("click", () => $("confirm").close());
+$("confirm-yes").addEventListener("click", guarded(async () => {
+  $("confirm").close();
+  await act("/api/flatten");
+}));
+
+poll();
+setInterval(poll, 5000);
+</script>
+</body>
+</html>

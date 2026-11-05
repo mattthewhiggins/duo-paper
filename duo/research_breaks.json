@@ -1,0 +1,44 @@
+{
+ "about": "The research's breaks: research.harness.clean.split_breaks over the whole development spot_1d panel gives, for each asset below, the first bar of each later part (X~2, X~3, ...). duo/sys_data.py names its live columns from this, so a break older than the 600-day window still gets the research's X~N name. tests/test_sys_parity.py checks this table against the research's own splits.",
+ "source": "data/research/dev/spot_1d.npz",
+ "source_sha256": "0f26101b55940a7fead06d3c08a80e9304ca3ca74d6b4e9101929032b7a9098e",
+ "last_bar_ts": 1721088000,
+ "cuts": {
+  "BNX": [
+   1677024000
+  ],
+  "BTCST": [
+   1616112000
+  ],
+  "COCOS": [
+   1611360000
+  ],
+  "CVC": [
+   1683849600
+  ],
+  "DREP": [
+   1617321600
+  ],
+  "FTT": [
+   1695340800
+  ],
+  "LUNA": [
+   1653955200
+  ],
+  "QUICK": [
+   1689897600
+  ],
+  "STRAX": [
+   1711584000
+  ],
+  "SUN": [
+   1623974400
+  ],
+  "VEN": [
+   1539907200
+  ],
+  "VIDT": [
+   1667952000
+  ]
+ }
+}

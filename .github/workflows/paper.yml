@@ -1,0 +1,142 @@
+# The paper test, run by GitHub Actions so it carries on with the laptop shut down. README, "Running the paper test on
+# GitHub Actions", says how it works, and RUNBOOK section 12 how to run it.
+#
+# Every job is a fresh machine. It restores the paper run's state (data/, kept on the paper-state branch), runs one poll
+# of the systematic runner, saves the state, and publishes the status page to GitHub Pages. Paper only: it reads public
+# Kraken and Binance prices, needs no keys or secrets, and never places a real order.
+name: Paper run
+
+on:
+  schedule:
+    # Every 15 minutes from 00:05 to 03:50 UTC: the day's decision, then its orders until the last has crossed.
+    - cron: '5,20,35,50 0-3 * * *'
+    # Hourly at :35 for the rest of the day: the risk checks, the heartbeat and the status page.
+    - cron: '35 4-23 * * *'
+    # 23:47, so the next day's loss limit starts from a reading taken just before midnight.
+    - cron: '47 23 * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: >-
+          tick: one poll, as the schedule does. start: begin the paper run (once). resume: lift the kill switch, then
+          tick. flatten: sell everything and halt. probe: check the data sources, changing nothing.
+        type: choice
+        options: [tick, start, resume, flatten, probe]
+        default: tick
+
+# One run at a time, and none cancelled halfway: two at once would each restore the same state, and the later save
+# would lose the earlier one's fills (save_state.sh's lease refuses that anyway).
+concurrency:
+  group: paper-run
+  cancel-in-progress: false
+
+permissions: {}  # Each job asks for only what it needs.
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write  # To push the paper-state branch. Nothing else is ever pushed.
+    env:
+      ACTION: ${{ inputs.action || 'tick' }}  # A scheduled run has no inputs, so it ticks.
+      DUO_DATA_DIR: ${{ github.workspace }}/state/data
+      TZ: UTC
+    outputs:
+      site: ${{ steps.upload.outcome == 'success' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: requirements-paper.txt
+
+      - name: Install
+        run: python -m pip install -r requirements-paper.txt
+
+      - name: Probe the data sources
+        if: env.ACTION == 'probe'
+        run: python -m duo probe
+
+      - name: Restore the paper state
+        id: state
+        if: env.ACTION != 'probe'
+        run: bash ops/actions/restore_state.sh state "$ACTION"
+
+      - name: Tick
+        id: tick
+        if: steps.state.outputs.started == 'true'
+        timeout-minutes: 5  # A hung request mustn't take the whole job, so the state is still saved.
+        run: |
+          set +e
+          case "$ACTION" in
+            tick) python -m duo tick ;;
+            start) python -m duo tick --first-run ;;
+            resume) python -m duo resume && python -m duo tick ;;
+            flatten) python -m duo tick --flatten ;;
+            *) echo "::error::Unknown action: $ACTION"; exit 1 ;;
+          esac
+          code=$?
+          if [ "$code" -eq 3 ]; then
+            echo "::error title=No paper state::paper-state has no database, so nothing ran. A new paper run only" \
+              "starts on purpose: run the workflow with action start."
+          fi
+          exit "$code"
+
+      # Whatever the tick did is kept, even if it failed partway, as the laptop's database would keep it. The one
+      # exception is a start that failed: it leaves nothing behind, so a broken first run can't become the paper run.
+      - name: Decide what to keep
+        id: keep
+        if: always() && steps.state.outputs.started == 'true'
+        env:
+          NEW: ${{ steps.state.outputs.new }}
+          TICK: ${{ steps.tick.outcome }}
+        run: |
+          if [ "$NEW" != true ] || [ "$TICK" = success ]; then
+            echo "state=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::The start failed, so nothing was saved and the paper run hasn't begun. Run the workflow" \
+              "with action start again."
+          fi
+
+      - name: Save the paper state
+        id: save
+        if: always() && steps.keep.outputs.state == 'true'
+        run: bash ops/actions/save_state.sh state
+
+      # Only a saved state is published, so the page never shows what the next run won't carry on from.
+      - name: Build the status page
+        id: site
+        if: always() && steps.save.outcome == 'success'
+        run: python -m duo site --out _site
+
+      - name: Upload the status page
+        id: upload
+        if: always() && steps.site.outcome == 'success'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
+        with:
+          path: _site
+
+      # Last, so a run that needs you (halted, degraded too long, the decision overdue, no fresh heartbeat) fails, and
+      # GitHub emails you.
+      - name: Watchdog
+        if: always() && steps.keep.outputs.state == 'true'
+        run: python -m duo watchdog
+
+  deploy:
+    needs: run
+    # Even when the watchdog failed the run: the page is where you see why.
+    if: ${{ !cancelled() && needs.run.outputs.site == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write     # To deploy the status page.
+      id-token: write  # So Pages can check the deployment comes from this workflow.
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1

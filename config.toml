@@ -1,0 +1,114 @@
+# Duo settings. Restart the bot after changing anything here.
+# Everything under [risk] is enforced in code. The agents can read it but can't change it.
+
+mode = "paper"              # "paper" = simulated fills at live prices. "live" = real orders, see README.
+
+[portfolio]
+quote = "USD"               # USD, GBP or EUR. In live mode, use the cash currency held on Kraken.
+starting_capital = 1000     # The bot only ever trades this much, even if the account holds more.
+assets = ["BTC", "ETH", "SOL"]
+
+[fees]
+maker_pct = 0.40            # Orders that wait in the book. Kraken Pro entry tier as of July 2026.
+taker_pct = 0.80            # Orders that fill immediately. Check yours at kraken.com/features/fee-schedule.
+paper_slippage_pct = 0.05   # Extra cost assumed on each simulated immediate fill.
+paper_trade_through_pct = 0.02  # A simulated resting order only fills once the market trades this far past it.
+
+[risk]
+max_order_pct = 10          # Largest single buy, as % of equity.
+max_asset_pct = 35          # Largest holding in one asset, as % of equity.
+min_cash_pct = 20           # Cash that must remain after any buy, as % of equity.
+max_buys_per_day = 4        # Sells are never capped, so the bot can always reduce risk.
+max_fees_30d_pct = 3        # No new buys once fees in the last 30 days would pass this % of equity.
+min_target_fee_multiple = 2 # Every buy's profit target must be this many round trips of fees above its entry.
+resting_ttl_minutes = 10    # A resting order that hasn't filled by then is cancelled.
+max_active_plans = 5        # How many price-triggered buys can wait at once.
+max_plan_hours = 72         # The longest a price-triggered buy can wait.
+max_trigger_distance_pct = 25   # How far from the current price a trigger can be.
+max_limit_slippage_pct = 0.5    # Agent orders won't fill worse than this far from the quote.
+stop_limit_slippage_pct = 2.0   # Stop-loss and sell-everything orders can accept more, to get out.
+min_stop_distance_pct = 1.5     # Every buy needs a stop at least this far below the price...
+max_stop_distance_pct = 25      # ...and no further than this.
+daily_loss_pause_pct = 5    # Lose this much in a UTC day and buys pause until the next day.
+drawdown_halt_pct = 20      # Fall this far from peak equity and agent trading stops until you resume it.
+max_quote_age_seconds = 90  # No trading on prices older than this.
+
+[agents]
+model = "claude-opus-5-5"   # Makes every decision. Cheaper options: claude-sonnet-5-5, claude-haiku-5-5.
+effort = "medium"           # low, medium, high, xhigh or max. Higher costs more per session.
+discussion_minutes = 5      # How often the agents talk between decisions. 0 turns this off.
+discussion_model = "claude-haiku-5-5"   # Discussions can't change anything, so they use a far cheaper model.
+discussion_effort = "medium"
+max_decisions_per_day = 4   # The most Opus sessions the discussions can ask for in a UTC day.
+max_rounds = 3              # Strategist/Risk Manager back-and-forths per session before giving up.
+max_steps_per_turn = 8      # Model calls one agent can make in a single turn.
+min_check_in_minutes = 30   # The Strategist picks when to talk next, within these bounds.
+max_check_in_minutes = 720
+wake_on_move_pct = 3        # Also wake if a price moves this far since the last session.
+session_budget_usd = 1.00   # API spend limits. When one is reached the agents sleep; stop-losses keep running.
+daily_budget_usd = 2
+monthly_budget_usd = 50
+
+[engine]
+poll_seconds = 10           # How often prices, stops, targets, plans and resting orders are checked.
+reconcile_seconds = 60      # How often live balances are compared with the bot's books.
+snapshot_minutes = 5        # How often the equity chart gets a new point.
+
+[systematic]
+# A research strategy traded by code, once a day, on paper. See README, "The systematic runner".
+# While this is on, the agents can't trade, the [portfolio], [fees] and [risk] sections above don't apply,
+# and everything goes to data/paper_systematic.db. Live mode is refused: see README, "Going live with the runner".
+enabled = true
+# The research's chosen fallback, for PAPER TRADING ONLY: F1 trend on BTC alone (50-day moving average) at a
+# 20% volatility target, the F1 winner chosen on development data. It did NOT pass the holdout gate: it failed G2
+# (holdout Sharpe below half its development Sharpe) on both tracks. No spot strategy passed. See RUNBOOK.md, top,
+# and research/artifacts/holdout_results.md (kept privately, like the other research results cited here).
+# Not financial advice.
+# Any F1 or F2 variant id from research/artifacts/variants.jsonl works, or dca_BTC / dca_BTC_ETH.
+# F3 (perps) and F4 (intraday) are refused.
+strategy = "F1__sma_50__BTC__vol20"
+agents_enabled = false      # Agent discussions. Off by default, and they can never trade in this mode.
+starting_capital_gbp = 20000    # The research's account size, converted once to the book's currency at start.
+maker_pct = 0.22            # Kraken Pro Tier 3, which preregistration section 5 says GBP 20,000 qualifies for.
+taker_pct = 0.38
+loop_minutes = 5            # Health checks, data freshness and order management.
+settle_minutes = 2          # The daily decision is made at the first loop after 00:00 UTC + this.
+reprice_minutes = 15        # A resting order moves to the current best bid or ask this often...
+taker_after_minutes = 120   # ...and after this long, what's left crosses the spread...
+taker_cap_pct = 0.5         # ...at no worse than this far from the quote.
+history_days = 600          # Daily bars fetched from Binance for each decision.
+# Hard limits below, each checked on every order and logged on every decision.
+# 100 because the strategy holds one asset (BTC), whose sleeve is the whole account, so at 50 the runner refuses to
+# start. This cap isn't what sizes it: the strategy's own volatility sizing (a 20% volatility target, never above the
+# sleeve) sets its BTC weight each day, as in the backtest. Its average exposure was 20.2% of equity on development
+# (research/artifacts/selection_K.json) and 29.9% on the holdout (research/artifacts/holdout_results.json).
+max_asset_pct = 100
+asset_margin_pct = 2        # Per asset: the strategy's largest sleeve + this, and never above max_asset_pct.
+max_gross_pct = 100         # Sum of holdings. No shorts and no leverage, ever.
+order_margin_pct = 2        # No single order above its target change + this much of equity.
+daily_loss_pct = 8          # Down this much from the UTC day's start: no buys for the rest of the day.
+kill_drawdown_pct = 45      # Down this much from peak: cancel, sell everything, halt until you resume it.
+signal_stale_minutes = 30   # No new orders while the just-closed daily bar is still missing this long after 00:00 UTC.
+max_quote_age_seconds = 90  # No new orders on a Kraken quote older than this...
+max_frozen_quote_seconds = 600  # ...or one that hasn't changed at all for this long.
+max_api_errors = 5          # No new orders after this many API errors in a row. Clears by itself.
+heartbeat_stale_minutes = 15    # python -m duo watchdog reports the bot down when its heartbeat is older than this,
+degraded_alert_minutes = 30     # ...and alerts when it has been degraded (no new orders, no decision) this long.
+# A strategy whose one-asset target can pass max_asset_pct (an F1 BTC-only variant, F2 with invvol weights) is refused
+# at start, because paper would then hold less than the research's strategy. Raise max_asset_pct, or set this to true to
+# run it capped: each decision then logs the research target and the capped one, and compare replays the capped one.
+allow_capped_targets = false
+# Binance's public market-data hosts, tried in order. Both serve Binance's own spot klines. data-api.binance.vision is
+# its market-data-only host, which answers where api.binance.com refuses (HTTP 451, as it does for US addresses).
+binance_urls = ["https://data-api.binance.vision", "https://api.binance.com"]
+# Scheduled runs only: python -m duo tick, one poll in a fresh process every 15 to 60 minutes, as on GitHub Actions.
+# python -m duo run ignores these.
+cron_gap_minutes = 180      # A longer gap since the last heartbeat counts as an outage: a resting order is judged on
+                            # Kraken's 1-minute candles over its life, and closes unfilled if nothing traded through it.
+cron_decision_grace_minutes = 120   # The decision-overdue alert waits this long after 00:00 UTC. Schedulers run late.
+cron_slack_seconds = 120    # Re-pricing and the switch to taker come this much early, so a run 14 minutes after the
+                            # last still re-prices.
+
+[dashboard]
+host = "127.0.0.1"          # Anything other than localhost requires DUO_DASHBOARD_TOKEN in .env.
+port = 8787

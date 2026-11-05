@@ -1,0 +1,4 @@
+# What the paper run needs on GitHub Actions (.github/workflows/paper.yml): numpy, the systematic runner's one
+# third-party dependency, at the version the local .venv runs. anthropic (requirements.txt) is only for the tests and
+# the agents, and the paper run has the agents off.
+numpy==2.5.4
