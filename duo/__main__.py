@@ -321,7 +321,8 @@ def systematic_db(config: Config, command: str | None = None) -> DB:
                "./start.sh.")
         sys.exit(f"No systematic paper run here: {config.db_path} doesn't exist. On GitHub Actions, that means "
                  f"paper-state has no database: start the run with the Paper run workflow's action start (RUNBOOK "
-                 f"12.3). {mac}")
+                 f"12.3). {mac} If the run has moved to Render, it's on the service's disk instead: use python3 "
+                 f"ops/render/ctl.py in the service's Shell (RUNBOOK 13).")
     return DB(config.db_path)
 
 

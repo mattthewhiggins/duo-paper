@@ -1,10 +1,13 @@
-"""The status page for GitHub Pages (duo/site.py): what status.json holds, that every number in it is finite, that a
-failing compare is reported and not raised, that building it never changes the run's database, and that the page is
-one self-contained file. No network: the runner's stand-ins (tests/sys_helpers.py) make the decisions and fills,
-through the engine as a scheduled run does, so the hold-BTC comparison has its benchmark and snapshots too."""
+"""The status page (duo/site.py): what status.json holds, that every number in it is finite, that a failing compare is
+reported and not raised, that building it never changes the run's database, and that the page is one self-contained
+file. It's built for GitHub Pages (cron mode) as it always was, and for Render (loop mode) by the loop's own schedule
+and limits, with the move from one to the other. No network: the runner's stand-ins (tests/sys_helpers.py) make the
+decisions and fills, through the engine as a scheduled run does, so the hold-BTC comparison has its benchmark and
+snapshots too, and through a fresh unscheduled runner for the loop after the move."""
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import sqlite3
@@ -19,9 +22,11 @@ from pathlib import Path
 from unittest import mock
 
 from duo import site
+from duo.brokers import PaperBroker
 from duo.db import DB
 from duo.engine import Engine
 from duo.ledger import Portfolio
+from duo.systematic import SystematicRunner
 
 from .sys_helpers import D0, DAY, cron_run, make_env, run_until, step
 
@@ -100,9 +105,9 @@ def sha(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
 
 
-def build_site(env, now):
+def build_site(env, now, schedule=None):
     out = Path(tempfile.mkdtemp())
-    return site.build(env.config, env.db, out, now=now), out
+    return site.build(env.config, env.db, out, now=now, schedule=schedule), out
 
 
 def undecided(test, runs):
@@ -118,9 +123,61 @@ def undecided(test, runs):
     return env
 
 
+# The move from GitHub Actions to Render, as the cutover makes it: GitHub's last run at 23:47 UTC, then nothing for 37
+# minutes, then the loop's first check at 00:24, made as soon as it starts and so off its 5-minute grid (00:02, 00:07).
+GITHUB_RUNS = [D0 - DAY + minutes * 60 for minutes in (20 * 60 + 35, 21 * 60 + 35, 22 * 60 + 35, 23 * 60 + 35,
+                                                         23 * 60 + 47)]
+LAST_CRON = GITHUB_RUNS[-1]
+MOVED_AT = LAST_CRON + 37 * 60
+
+
+def on_github(test):
+    """A run on GitHub Actions from 20:00 UTC the day before D0: hourly runs to 23:47, as python -m duo tick makes them,
+    each recording sys_tick_at before anything else. The first decides and buys."""
+    env = btc_env(test, now=D0 - DAY + 20 * 3600)
+    for t in GITHUB_RUNS:
+        env.db.set("sys_tick_at", t)
+        cron_run(env, t)
+    return env
+
+
+def on_render(env, until):
+    """The run carried on by python -m duo run on the same database: a fresh runner that isn't scheduled, as a new
+    process makes it, polled every 10 s from the move until `until`. Its first check decides the day."""
+    env.runner = SystematicRunner(env.config, env.db, env.market, PaperBroker(env.config), env.binance, env.strategy,
+                                  env.start)
+    env.runner._track()
+    run_until(env, MOVED_AT, until, every=10)
+    return env
+
+
+def hold(env, since):
+    """A hold on Render, made at `since`: the HOLD file in the data folder (RUNBOOK section 13.6)."""
+    path = env.config.data_dir / site.HOLD_FILE
+    path.touch()
+    os.utime(path, (since, since))
+    return path
+
+
+def loop_until(test, last):
+    """The run moved to Render and the loop checking on its grid until `last`: after 01:00 UTC as heartbeat rows only,
+    since a day of 10-second polls would be slow."""
+    env = on_render(on_github(test), D0 + 3600)
+    rows = [(t, "ok", "24950.00", "[]", "[]") for t in range(D0 + 62 * 60, last + 1, 300)]
+    env.db.conn.executemany("INSERT INTO sys_heartbeats(ts, status, equity, halts, controls) VALUES(?, ?, ?, ?, ?)",
+                            rows)
+    return env
+
+
+def complete():
+    """compare's summary, as if it had found all 28 finished days."""
+    report = {"ok": True, "error": None, "decisions": 29, "summary": {"days": 28}, "notes": [], "days": []}
+    return mock.patch("duo.site._compare", return_value=(report, "# Paper against backtest\n"))
+
+
 # The page's own script, run in node once per case on a status.json at a fixed clock, with just enough of a DOM. For
 # each case it prints the text the script put in each element with an id (a line per block), the banner's state and
-# anything it logged as an error.
+# anything it logged as an error. A case whose status is null is a status.json that won't load: the server answers 503.
 RENDER = r"""
 "use strict";
 const fs = require("fs");
@@ -170,7 +227,7 @@ class Element extends Node {
       window: { addEventListener() {} }, location: { protocol: "https:" }, Node, Date: FixedDate, Intl,
       console: { error: (...args) => errors.push(args.join(" ")) },
       setInterval() {}, setTimeout() {}, clearTimeout() {},
-      fetch: async () => ({ ok: true, json: async () => status }),
+      fetch: async () => (status === null ? { ok: false, status: 503 } : { ok: true, json: async () => status }),
     });
     await new Promise((resolve) => setImmediate(() => setImmediate(resolve)));
     const text = {};
@@ -185,7 +242,8 @@ class Element extends Node {
 
 
 def render(test, cases):
-    """[(status, now)] -> what the page shows for each: {"text": {id: text}, "state": the banner's, "errors": [...]}."""
+    """[(status, now)] -> what the page shows for each: {"text": {id: text}, "state": the banner's, "errors": [...]}.
+    A status of None is a status.json that won't load."""
     folder = Path(tempfile.mkdtemp())
     (folder / "render.js").write_text(RENDER)
     (folder / "cases.json").write_text(json.dumps([{"status": status, "now": now} for status, now in cases]))
@@ -501,6 +559,156 @@ class Build(unittest.TestCase):
         self.assertEqual(counts(D0 + DAY + 360), (0, 37, 2, 38), "a day on, the last 24 hours have had no run")
 
 
+class OnRender(unittest.TestCase):
+    """The page Render's service builds (loop mode), judged by the loop's own schedule and limits, and the move."""
+
+    def check_file(self, status, out):
+        Build.check_file(self, status, out)
+
+    def test_the_move_is_told_from_the_ticks(self):
+        # Built with no --schedule, as python -m duo site would build a copy of Render's database anywhere.
+        env = on_render(on_github(self), D0 + 3600)
+        status, out = build_site(env, D0 + 3630)
+        self.check_file(status, out)
+        host = status["host"]
+        first = env.db.one("SELECT MIN(ts) AS ts FROM sys_heartbeats WHERE ts > ?", (LAST_CRON,))["ts"]
+        self.assertEqual((host["schedule"], host["name"]), ("loop", "Render"))
+        self.assertEqual((host["last_cron_at"], host["moved_at"], host["cron_runs"]), (LAST_CRON, first, 5))
+        self.assertEqual(first, MOVED_AT, "the loop's first check is straight away")
+        self.assertEqual(host["move_gap_minutes"], 37)
+        self.assertEqual((host["loop_minutes"], host["settle_minutes"], host["beat_late_minutes"],
+                          host["beat_stale_minutes"]), (5, 2, 11, 15))
+        self.assertEqual((host["held"], host["held_since"], host["seed_sha"]), (False, None, None))
+        self.assertEqual(status["heartbeat"]["schedule"], "loop", "the heartbeat file agrees")
+        self.assertEqual(status["stale_after_minutes"], 20)
+        self.assertEqual(status["notes"], site.NOTES_LOOP)
+        self.assertEqual(status["strategy"]["decides"],
+                         "Once a day, at the first loop from 00:02 UTC, on the daily bar that closed at 00:00 UTC.")
+        self.assertEqual(status["tick_at"], LAST_CRON, "still there, for the record")
+
+    def test_the_seed_marker_comes_before_sys_tick_at(self):
+        # A tick on Render (never meant to happen: RUNBOOK 13.10) would move sys_tick_at past the loop's checks. The
+        # marker the cutover wrote still says where GitHub's runs ended.
+        env = on_render(on_github(self), D0 + 3600)
+        marker = env.config.data_dir / site.SEED_FILE
+        marker.write_text(json.dumps({
+            "schema": 1, "sha": "a" * 40, "db_sha256": "b" * 64, "seeded_at": LAST_CRON + 1200,
+            "seeded_at_utc": "2026-11-02 00:07:00 UTC", "sys_tick_at": LAST_CRON, "last_cron_at": LAST_CRON,
+            "cron_runs": 5, "start_sha256": "c" * 64}))
+        env.db.set("sys_tick_at", D0 + 3600)
+        status, out = build_site(env, D0 + 3630)
+        self.check_file(status, out)
+        host = status["host"]
+        self.assertEqual((host["schedule"], host["last_cron_at"], host["moved_at"], host["cron_runs"],
+                          host["seed_sha"]), ("loop", LAST_CRON, MOVED_AT, 5, "a" * 40))
+        self.assertEqual(status["runs"]["last_24h"], 8)
+        marker.unlink()  # Without it, sys_tick_at alone counts every check as GitHub's.
+        self.assertEqual(build_site(env, D0 + 3630)[0]["host"]["schedule"], "cron")
+        host = build_site(env, D0 + 3630, schedule="loop")[0]["host"]
+        self.assertEqual((host["last_cron_at"], host["moved_at"], host["cron_runs"]), (D0 + 57 * 60, None, 13))
+
+    def test_before_the_loops_first_check(self):
+        env = on_github(self)
+        status, out = build_site(env, LAST_CRON + 30 * 60, schedule="loop")  # As Render's service builds it.
+        self.check_file(status, out)
+        host = status["host"]
+        self.assertEqual((host["schedule"], host["last_cron_at"], host["cron_runs"]), ("loop", LAST_CRON, 5))
+        self.assertEqual((host["moved_at"], host["move_gap_minutes"]), (None, None))
+        runs = status["runs"]
+        self.assertEqual((runs["last_24h"], runs["scheduled_24h"], runs["since_move_24h"]), (0, 0, False))
+        self.assertEqual(build_site(env, LAST_CRON + 30 * 60)[0]["host"]["schedule"], "cron",
+                         "without --schedule loop, the database alone still says GitHub")
+
+    def test_checks_are_counted_from_the_move_against_the_loops_grid(self):
+        env = on_render(on_github(self), D0 + 3600)
+        runs = build_site(env, D0 + 3630)[0]["runs"]
+        # 00:24, the start's own check, then the grid from 00:27 to 00:57: 8 checks for the 7 that were due.
+        self.assertEqual((runs["last_24h"], runs["scheduled_24h"], runs["last_7d"], runs["scheduled_7d"]), (8, 7, 8, 7))
+        self.assertEqual((runs["since_move_24h"], runs["since_move_7d"]), (True, True))
+        self.assertEqual(runs["longest_gap_24h_minutes"], 5, "the move's 37 minutes isn't a gap between checks")
+        self.assertEqual((runs["scheduled_longest_gap_minutes"], runs["next_expected_at"]), (5, D0 + 3600 + 120))
+        self.assertEqual((runs["total"], runs["first_at"]), (13, GITHUB_RUNS[0]))
+        self.assertEqual(runs["schedule"], {"cron": [], "slots_utc": [], "per_day": 288,
+                                            "text": site.NOTES_LOOP["schedule"],
+                                            "summary": "Every 5 minutes, from 00:02 UTC"})
+        # A day of the grid on, the last 24 hours are a whole day of checks, and the last 7 days still begin at the
+        # move. (Rows only: a day of 10-second polls would be slow.)
+        rows = [(t, "ok", "24950.00", "[]", "[]") for t in range(D0 + 62 * 60, D0 + DAY + 3600, 300)]
+        env.db.conn.executemany("INSERT INTO sys_heartbeats(ts, status, equity, halts, controls) VALUES(?, ?, ?, ?, ?)",
+                                rows)
+        runs = build_site(env, D0 + DAY + 3630)[0]["runs"]
+        self.assertEqual(len(rows), 288)
+        self.assertEqual((runs["last_24h"], runs["scheduled_24h"], runs["last_7d"], runs["scheduled_7d"]),
+                         (288, 288, 296, 295))
+        self.assertEqual((runs["since_move_24h"], runs["since_move_7d"]), (False, True))
+
+    def test_a_decision_is_overdue_from_when_the_loop_counts_it(self):
+        # The loop counts the day's decision overdue from signal_stale_minutes (30) after 00:00 UTC, as the watchdog
+        # reads it from the heartbeat, not after GitHub's 2 hours.
+        env = on_github(self)
+        with mock.patch("duo.systematic.SystematicRunner._plan", side_effect=RuntimeError("targets() raised")):
+            on_render(env, D0 + 45 * 60)
+        beat = json.loads((env.config.data_dir / "heartbeat_systematic.json").read_text())
+        self.assertEqual((beat["schedule"], beat["ts"]), ("loop", D0 + 42 * 60))
+        today = build_site(env, beat["ts"])[0]["today"]
+        self.assertEqual((today["decided"], today["overdue_from"], today["overdue_minutes"]),
+                         (False, D0 + 30 * 60, beat["decision_overdue_minutes"]))
+        self.assertEqual(today["overdue_minutes"], 12)
+
+    def test_a_held_or_stopped_loop_has_no_decision_overdue(self):
+        # The loop's heartbeat counts the day's decision overdue at its own time, and that's what the watchdog reads.
+        # Held or stopped overnight, the loop never checks after 00:30, so a page built then doesn't call it overdue.
+        last = D0 + 23 * 3600 + 47 * 60
+        env = loop_until(self, last)
+        path = hold(env, last + 4 * 60)
+        today = build_site(env, D0 + DAY + 32 * 60 + 45, schedule="loop")[0]["today"]
+        self.assertEqual((today["decided"], today["overdue_from"], today["overdue_minutes"]),
+                         (False, D0 + DAY + 30 * 60, None))
+        path.unlink()  # Stopped, with no hold.
+        today = build_site(env, D0 + DAY + 47 * 60 + 45, schedule="loop")[0]["today"]
+        self.assertEqual((today["decided"], today["overdue_minutes"]), (False, None))
+        # On GitHub it's as it was: overdue from 02:00 UTC, whether a run has been since or not.
+        today = build_site(env, D0 + DAY + 2 * 3600 + 47 * 60 + 45, schedule="cron")[0]["today"]
+        self.assertEqual((today["overdue_from"], today["overdue_minutes"]), (D0 + DAY + 2 * 3600, 47.75))
+
+    def test_the_loop_crosses_the_spread_on_time(self):
+        # A scheduled run switches a working order to taker cron_slack_seconds (2 minutes) early; the loop on time.
+        env = btc_env(self)
+        run_until(env, D0 + 60, D0 + 600, every=60)
+        order = env.db.one("SELECT * FROM sys_orders WHERE status = 'working'")
+        github, loop = build_site(env, D0 + 700)[0], build_site(env, D0 + 700, schedule="loop")[0]
+        self.assertEqual(github["orders"][0]["taker_from"], order["created_at"] + 7200 - 120)
+        self.assertEqual(loop["orders"][0]["taker_from"], order["created_at"] + 7200)
+        self.assertEqual(loop["decisions"][0]["orders"][0]["taker_from"], order["created_at"] + 7200)
+        self.assertIn("crosses the spread from", loop["orders"][0]["outcome"])
+
+    def test_a_hold_is_shown_with_when_it_began(self):
+        env = on_render(on_github(self), D0 + 3600)
+        path = hold(env, D0 + 3500)
+        status, out = build_site(env, D0 + 3630, schedule="loop")
+        self.check_file(status, out)
+        self.assertEqual((status["host"]["held"], status["host"]["held_since"]), (True, D0 + 3500))
+        self.assertIsNone(build_site(env, D0 + 3630, schedule="cron")[0]["host"]["held"], "GitHub has no hold")
+        path.unlink()
+        host = build_site(env, D0 + 3630, schedule="loop")[0]["host"]
+        self.assertEqual((host["held"], host["held_since"]), (False, None))
+
+    def test_a_github_build_says_so_and_is_otherwise_as_it_was(self):
+        env = on_github(self)
+        hold(env, LAST_CRON)  # Means nothing on GitHub.
+        status, out = build_site(env, LAST_CRON + 60)
+        self.check_file(status, out)
+        host = status["host"]
+        self.assertEqual((host["schedule"], host["name"], host["last_cron_at"], host["cron_runs"]),
+                         ("cron", "GitHub Actions", LAST_CRON, 5))
+        self.assertEqual((host["moved_at"], host["move_gap_minutes"], host["held"], host["held_since"],
+                          host["seed_sha"]), (None, None, None, None, None))
+        self.assertEqual((status["stale_after_minutes"], status["notes"]), (site.STALE_MINUTES, site.NOTES))
+        self.assertEqual(status["today"]["overdue_from"], D0 - DAY + 120 * 60, "after GitHub's grace")
+        self.assertEqual(status["runs"]["schedule"]["per_day"], 37)
+        self.assertNotIn("since_move_24h", status["runs"])
+
+
 class Words(unittest.TestCase):
     def test_reasons_in_plain_words(self):
         # The usual cause is no usable price for the holdings now: the day's start is known from its first run.
@@ -599,6 +807,17 @@ class Page(unittest.TestCase):
         self.assertRegex(css, r":root\s*\{[^}]*--page:")
         self.assertIn("@media (prefers-color-scheme: dark)", css)
         self.assertRegex(css, r"body\s*\{[^}]*background: var\(--page\)")
+
+    def test_what_shows_before_status_json_loads_fits_either_host(self):
+        # status.json says which host runs the run. Until it has loaded, the page's own words are true on both.
+        description, = (attrs["content"] for tag, attrs in self.page.attrs
+                        if tag == "meta" and attrs.get("name") == "description")
+        self.assertEqual(description, "A paper-trading run of a research strategy: no real money.")
+        self.assertIn('<p class="lede" id="lede">Simulated orders at real prices. No exchange keys, no real money. Not '
+                      'financial advice, and not a recommendation to buy, sell or hold anything.</p>', self.text)
+        self.assertIn("<p id=\"foot-built\">Built by duo/site.py from the run's database.</p>", self.text)
+        for gone in ("the workflow's start action", "rebuilt after every scheduled run"):
+            self.assertNotIn(gone, self.text)
 
     @unittest.skipUnless(shutil.which("node"), "node isn't installed")
     def test_the_script_has_no_syntax_errors(self):
@@ -753,6 +972,208 @@ class Rendered(unittest.TestCase):
         self.assertIn("Not financial advice, and not a recommendation to buy, sell or hold anything.",
                       page["text"]["about-body"])
 
+    def test_a_status_file_that_wont_load_fits_either_host(self):
+        # status.json is served beside the page on GitHub Pages and on Render, so a first load that fails is brief.
+        page, = render(self, [(None, D0)])
+        text = page["text"]
+        self.assertEqual((page["state"], text["banner-title"]), ("error", "Couldn't load the run's status"))
+        self.assertEqual(text["banner-body"], "status.json didn't load: the server answered HTTP 503.\nThis is usually "
+                                              "brief: try again in a few minutes.")
+        for part, said in text.items():
+            self.assertNotRegex(said, r"(?i)workflow|start action|scheduled run", part)
+
+
+@unittest.skipUnless(shutil.which("node"), "node isn't installed")
+class RenderedOnRender(unittest.TestCase):
+    """What the page's script shows for status.json files Render's service builds (loop mode): the loop's own limits,
+    and Render's instructions where GitHub's were."""
+
+    HALTED = ("No decision is made while the run is halted, until it's resumed with python3 ops/render/ctl.py resume, "
+              "in the service's Shell on Render (RUNBOOK section 13.5).")
+    HELD = ("No decision is made while the loop is held: it's made at the first loop after the hold comes off (RUNBOOK "
+            "section 13.6).")
+
+    def assertNotGitHub(self, page, *parts):
+        """Nothing in the banner, or in these parts of the page, sends the reader to a tick, a workflow or the
+        repository's Actions tab: none of them is there on Render."""
+        for part in ("banner-title", "banner-body", *parts):
+            self.assertNotRegex(page["text"][part], r"(?i)tick|actions tab|workflow", part)
+
+    def test_running_normally(self):
+        env = on_render(on_github(self), D0 + 3600)
+        status, _ = build_site(env, D0 + 3630, schedule="loop")
+        page, = render(self, [(status, D0 + 3660)])
+        text = page["text"]
+        self.assertEqual((page["state"], text["banner-title"]), ("ok", "Running normally"))
+        self.assertEqual(text["banner-body"], f"Last check {at(D0 + 57 * 60)}, 4 minutes ago. Every check passed.")
+        health = text["health-facts"]
+        self.assertIn("Loop\nEvery 5 minutes, from 00:02 UTC\nRender runs it nonstop.", health)
+        self.assertIn(f"Checks in the last 24 hours\n8 checks since the move to Render on {at(MOVED_AT)}; 7 were due "
+                      "(one every 5 minutes)\nLongest gap between checks: 5 minutes (the loop's longest is 5 minutes).",
+                      health)
+        self.assertIn("Schedule\n288 checks a day", health)
+        self.assertIn(f"Where it runs\nRender since {at(MOVED_AT)}\nBefore that GitHub Actions ran 5 runs, "
+                      f"{at(GITHUB_RUNS[0])} to {at(LAST_CRON)}.\nNothing was checked for 37 minutes during the move.",
+                      health)
+        self.assertNotIn("scheduled run", health)
+        self.assertEqual(text["about-how"], site.NOTES_LOOP["schedule"])
+        self.assertEqual(text["about-differences"].split("\n"), site.NOTES_LOOP["differences"])
+        self.assertNotGitHub(page, *text)
+
+    def test_missed_checks_then_a_stopped_loop_then_a_stale_page(self):
+        # The loop's own limits: checks missed past two loops and a minute (11 minutes), the loop stopped past the
+        # watchdog's 15, and this page stale once it's 20 minutes old.
+        env = on_render(on_github(self), D0 + 3600)
+        last = D0 + 57 * 60
+        fine, late, stopped = (build_site(env, last + minutes * 60, schedule="loop")[0] for minutes in (10, 12, 16))
+        ok, attention, down, stale = render(self, [(fine, last + 620), (late, last + 740), (stopped, last + 980),
+                                                   (fine, last + 600 + 21 * 60)])
+        self.assertEqual(ok["state"], "ok")
+        self.assertEqual((attention["state"], attention["text"]["banner-title"]), ("attention", "Needs attention"))
+        self.assertIn(f"The loop has missed its last checks: it checks every 5 minutes, and the last was {at(last)} "
+                      "(12 minutes ago). The service's Logs on Render say why.", attention["text"]["banner-body"])
+        self.assertEqual((down["state"], down["text"]["banner-title"]), ("stale", "Stale: the loop has stopped"))
+        self.assertIn(f"the loop's last check was {at(last)}, 16 minutes ago.\nThe loop has stopped: the service's "
+                      "Logs on Render say why.", down["text"]["banner-body"])
+        self.assertEqual((stale["state"], stale["text"]["banner-title"]), ("stale", "Stale: not updated lately"))
+        self.assertIn("The service rebuilds this page every 5 minutes, so the figures below may be out of date.\nCheck "
+                      "the service's Events and Logs on Render.", stale["text"]["banner-body"])
+        for page in (ok, attention, down, stale):
+            self.assertNotGitHub(page)
+
+    def test_a_stopped_loop_is_caught_between_the_services_builds(self):
+        # The service builds 45 s after each loop, so at its builds a loop that stopped after its 00:57 check has a
+        # heartbeat 5:45, 10:45 or 15:45 old, never 11 to 15 minutes. By the reader's clock the page still says the
+        # checks were missed from 11 minutes, and the loop stopped from 15, whichever build it holds.
+        env = on_render(on_github(self), D0 + 3600)
+        last = D0 + 57 * 60
+        early, two_on = (build_site(env, last + seconds, schedule="loop")[0] for seconds in (5 * 60 + 45, 10 * 60 + 45))
+        cases = [(two_on, last + 11 * 60 + 30), (two_on, last + 15 * 60 + 30), (early, last + 10 * 60 + 40),
+                 (early, last + 13 * 60)]
+        missed, stopped, fine, late_refresh = render(self, cases)
+        self.assertEqual((missed["state"], missed["text"]["banner-title"]), ("attention", "Needs attention"))
+        self.assertIn(f"The loop has missed its last checks: it checks every 5 minutes, and the last was {at(last)} "
+                      "(12 minutes ago). The service's Logs on Render say why.", missed["text"]["banner-body"])
+        self.assertEqual((stopped["state"], stopped["text"]["banner-title"]), ("stale", "Stale: the loop has stopped"))
+        self.assertIn(f"The page was rebuilt {at(last + 10 * 60 + 45)}, but the loop's last check was {at(last)}, 16 "
+                      "minutes ago.", stopped["text"]["banner-body"])
+        # Never past a loop after the build: a healthy loop's heartbeat is at most about 10:45 old by then (a build
+        # that missed a slow decision loop's), so a reader whose refresh is late isn't told checks were missed.
+        for page in (fine, late_refresh):
+            self.assertEqual((page["state"], page["text"]["banner-title"]), ("ok", "Running normally"))
+
+    def test_a_hold_and_the_end_of_the_test(self):
+        # A hold is on purpose. Once the 28 days are compared it's how the test ends, and the page says Finished
+        # however old it is, so a last copy kept after the service is gone still reads so.
+        env = on_render(on_github(self), D0 + 3600)
+        path = hold(env, D0 + 3500)
+        held, _ = build_site(env, D0 + 3630, schedule="loop")
+        with complete():
+            ended, _ = build_site(env, D0 + 3630, schedule="loop")
+        path.unlink()
+        with complete():
+            going, _ = build_site(env, D0 + 3630, schedule="loop")
+        waiting, finished, month_on, carrying_on = render(self, [(held, D0 + 3660), (ended, D0 + 3660),
+                                                                 (ended, D0 + 30 * DAY), (going, D0 + 3660)])
+        self.assertEqual((waiting["state"], waiting["text"]["banner-title"]), ("waiting", "Held"))
+        self.assertIn(f"Held on purpose since {at(D0 + 3500)}: the loop is stopped, and stays stopped until the hold "
+                      "is taken off (RUNBOOK section 13.6).", waiting["text"]["banner-body"])
+        for page in (finished, month_on):
+            self.assertEqual((page["state"], page["text"]["banner-title"]), ("finished", "Finished"))
+            self.assertIn("The 28-day test is complete, with 28 finished days compared, and the loop has been held "
+                          f"since {at(D0 + 3500)}.\nThat's how the test ends on Render (RUNBOOK section 13.8).",
+                          page["text"]["banner-body"])
+            self.assertIn(": the 28-day test is complete (28 finished days compared), and the loop has been held since "
+                          f"{at(D0 + 3500)}, which ended it (RUNBOOK section 13.8).", page["text"]["lede"])
+            self.assertIn("The 28-day test is complete, with 28 finished days compared. The loop has been held since "
+                          f"{at(D0 + 3500)}, which ended it (RUNBOOK section 13.8).", page["text"]["about-facts"])
+            for part in ("lede", "about-facts"):
+                self.assertNotIn("carries on", page["text"][part])
+        # A month on, there's no decision due: the hold ended the test.
+        self.assertIn("Today's decision\nNone while held\nThe 28-day test is complete, and the loop has been held, "
+                      "which ended it (RUNBOOK section 13.8).", month_on["text"]["health-facts"])
+        self.assertIn(self.HELD, month_on["text"]["tiles"])
+        self.assertEqual(carrying_on["state"], "ok")
+        self.assertIn(": the 28-day test is complete (28 finished days compared), and the loop carries on until it's "
+                      "stopped at the end (RUNBOOK section 13.8).", carrying_on["text"]["lede"])
+        self.assertIn("The loop carries on until it's stopped at the end (RUNBOOK section 13.8).",
+                      carrying_on["text"]["about-facts"])
+        for page in (waiting, finished, month_on, carrying_on):
+            self.assertNotGitHub(page, "lede", "about-facts")
+
+    def test_halted_says_how_to_resume_on_render(self):
+        env = on_render(on_github(self), D0 + 3600)
+        env.runner.stop_trading(D0 + 3610, "paused for a test", flatten=False)
+        run_until(env, D0 + 3610, D0 + 3900, every=10)  # The 01:02 check beats halted.
+        status, _ = build_site(env, D0 + 3930, schedule="loop")
+        self.assertEqual(status["heartbeat"]["status"], "halted")
+        page, = render(self, [(status, D0 + 3960)])
+        text = page["text"]
+        self.assertEqual((page["state"], text["banner-title"]), ("halted", "Halted"))
+        self.assertIn("To resume: run python3 ops/render/ctl.py resume in the service's Shell on Render (RUNBOOK "
+                      "section 13.5). The loop picks it up at its next check.", text["banner-body"])
+        self.assertIn(self.HALTED, text["tiles"])
+        self.assertIn(f"Today's decision\nMade\n{self.HALTED}", text["health-facts"])
+        self.assertNotGitHub(page, "tiles", "health-facts")
+
+    def test_an_overdue_decision_points_at_the_event_log(self):
+        # The runner logs why a decision failed as an event, and on Render ctl.py events reads them.
+        env = on_github(self)
+        with mock.patch("duo.systematic.SystematicRunner._plan", side_effect=RuntimeError("targets() raised")):
+            on_render(env, D0 + 45 * 60)
+        status, _ = build_site(env, D0 + 45 * 60 + 30, schedule="loop")
+        page, = render(self, [(status, D0 + 46 * 60)])
+        text = page["text"]
+        self.assertEqual((page["state"], text["banner-title"]), ("attention", "Needs attention"))
+        self.assertIn("Today's decision is 16 minutes overdue, although the loop is running: python3 ops/render/ctl.py "
+                      "events, in the service's Shell on Render, says why (RUNBOOK section 13.4).", text["banner-body"])
+        self.assertIn("Today's decision is 16 minutes overdue: see Run health below.", text["tiles"])
+        self.assertIn("Today's decision\nNot made yet\nOverdue by 16 minutes: the loop has checked since it was due, "
+                      "and none has made it. python3 ops/render/ctl.py events, in the service's Shell on Render, says "
+                      "why (RUNBOOK section 13.4).", text["health-facts"])
+        self.assertNotGitHub(page, "tiles", "health-facts")
+
+    def test_no_decision_is_due_while_the_loop_is_held(self):
+        # Held overnight: no decision is made until the hold comes off, and none is overdue.
+        last = D0 + 23 * 3600 + 47 * 60
+        env = loop_until(self, last)
+        hold(env, last + 4 * 60)
+        status, _ = build_site(env, D0 + DAY + 32 * 60 + 45, schedule="loop")
+        undecided = json.loads(json.dumps(status))
+        undecided["decisions"] = []  # As if the loop had never made one.
+        page, first = render(self, [(status, D0 + DAY + 33 * 60 + 45), (undecided, D0 + DAY + 33 * 60 + 45)])
+        text = page["text"]
+        self.assertEqual((page["state"], text["banner-title"]), ("waiting", "Held"))
+        self.assertIn(f"Today's decision\nNone while held\n{self.HELD}", text["health-facts"])
+        self.assertIn(self.HELD, text["tiles"])
+        for part in ("tiles", "health-facts"):
+            self.assertNotRegex(text[part], r"(?i)overdue", part)
+        self.assertIn(f"No decision yet. {self.HELD}", first["text"]["decisions-table"])
+        self.assertNotGitHub(page, "tiles", "health-facts")
+
+    def test_waiting_for_the_cutover_then_for_the_loops_first_check(self):
+        env = on_github(self)
+        seeded, _ = build_site(env, LAST_CRON + 30 * 60, schedule="loop")
+        missing = replace(env.raw_config, data_dir=Path(tempfile.mkdtemp()) / "nothing")
+        out = Path(tempfile.mkdtemp())
+        with mock.patch("duo.config.load", return_value=missing), mock.patch("builtins.print"):
+            site.main(["--out", str(out), "--schedule", "loop"])
+        unseeded = strict((out / "status.json").read_text())
+        before, after = render(self, [(unseeded, unseeded["generated_at"] + 60), (seeded, LAST_CRON + 31 * 60)])
+        self.assertEqual((before["state"], before["text"]["banner-title"]), ("waiting", "No paper run yet"))
+        self.assertEqual(before["text"]["banner-body"], "There's no paper run on the service's disk yet. It's seeded "
+                                                        "from GitHub once, at the cutover (RUNBOOK section 13.3), and "
+                                                        "the loop never starts one by itself.")
+        self.assertEqual(before["text"]["about-how"], site.NOTES_LOOP["schedule"])
+        self.assertEqual((after["state"], after["text"]["banner-title"]),
+                         ("waiting", "Waiting for the loop's first check"))
+        self.assertIn(f"GitHub Actions' last run was {at(LAST_CRON)}, 31 minutes ago.", after["text"]["banner-body"])
+        self.assertIn("Today's decision is due at the first loop from Mon 2 Nov, 00:02 UTC.", after["text"]["tiles"])
+        self.assertIn("Where it runs\nRender, with no check there yet\nBefore that GitHub Actions ran 5 runs",
+                      after["text"]["health-facts"])
+        for page in (before, after):
+            self.assertNotGitHub(page, "lede", "tiles", "health-facts")
+
 
 class CommandLine(unittest.TestCase):
     def test_python_m_duo_site_builds_from_the_configured_database(self):
@@ -786,6 +1207,24 @@ class CommandLine(unittest.TestCase):
             site.main(["--out", str(Path(tempfile.mkdtemp()))])
         self.assertIn("doesn't exist", str(stop.exception))
         self.assertFalse(missing.db_path.exists())
+
+    def test_schedule_loop_before_the_cutover_writes_a_page_saying_so(self):
+        # Render's service builds with --schedule loop from the start, so there's a page to serve before the seed too.
+        env = btc_env(self)
+        missing = replace(env.raw_config, data_dir=Path(tempfile.mkdtemp()) / "nothing")
+        out = Path(tempfile.mkdtemp()) / "site"
+        with mock.patch("duo.config.load", return_value=missing), mock.patch("builtins.print") as said:
+            site.main(["--out", str(out), "--schedule", "loop"])
+        self.assertIn("saying there's no paper run yet", said.call_args[0][0])
+        status = strict((out / "status.json").read_text())
+        Build.check_file(self, status, out)
+        self.assertEqual((status["start"], status["host"]["schedule"], status["host"]["held"]), (None, "loop", False))
+        self.assertEqual((status["notes"], status["compare"]["notes"]), (site.NOTES_LOOP, ["No paper run yet."]))
+        self.assertFalse(missing.data_dir.exists(), "nothing made where the database would be")
+        step(env, D0 + 60)
+        with mock.patch("duo.config.load", return_value=env.raw_config), mock.patch("builtins.print"):
+            site.main(["--out", str(out), "--schedule", "loop"])
+        self.assertEqual(strict((out / "status.json").read_text())["host"]["schedule"], "loop")
 
 
 if __name__ == "__main__":

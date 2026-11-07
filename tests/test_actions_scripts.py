@@ -123,6 +123,19 @@ class StateBranch(unittest.TestCase):
         self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
         return clone
 
+    def fenced(self, at="2026-11-06T12:00:00Z") -> str:
+        """The tree the cutover's fence leaves on paper-state (RUNBOOK 13.3 step 5): the database and the heartbeat
+        gone from data/, and a note in their place. Returns paper-state's new tip."""
+        clone, _, _ = self.job("tick")
+        data = clone / "state" / "data"
+        for name in ("paper_systematic.db", "heartbeat_systematic.json"):
+            (data / name).unlink()
+        (data / "MOVED_TO_RENDER.md").write_text("# The paper run moved to Render\n")
+        saved = self.save(clone, at)
+        self.assertEqual(saved.returncode, 0, saved.stdout + saved.stderr)
+        self.assertEqual(self.saved_files(), [".gitattributes", "data/MOVED_TO_RENDER.md"])
+        return self.tip("paper-state")
+
     def history(self) -> list[dict]:
         log = git("--git-dir", str(self.remote), "log", "--format=%H|%P|%cI|%an <%ae>|%s", "paper-state", cwd=self.tmp)
         keys = ("sha", "parents", "date", "author", "subject")
@@ -230,6 +243,68 @@ class StateBranch(unittest.TestCase):
         # Nothing is made in its place: the tick's own guard fails the run instead of starting a new paper run.
         self.assertFalse((clone / "state" / "data" / "paper_systematic.db").exists())
 
+    def test_render_backup_expects_a_branch_without_its_database_and_says_nothing(self):
+        # After the cutover's fence the database is on Render, so the warning and its advice to start a new run
+        # would be wrong on every Render backup run. It's still restored as it is, with nothing made in its place.
+        clone, _, _ = self.job("start")
+        (clone / "state" / "data" / "heartbeat_systematic.json").write_text("{}")
+        self.assertEqual(self.save(clone, "2026-11-05T00:20:00Z").returncode, 0)
+        clone, outputs, result = self.job("backup")
+        self.assertEqual(outputs, {"started": "true", "new": "false"})
+        self.assertNotIn("::warning::", result.stdout)
+        self.assertFalse((clone / "state" / "data" / "paper_systematic.db").exists())
+
+    def test_a_paper_state_fenced_for_render_refuses_every_action_but_backup(self):
+        # Since the cutover the run is on Render and Paper run is disabled. A Paper run that runs anyway, one GitHub
+        # started late or one started by hand, must do nothing: a tick would find no database, and a start would begin
+        # a second paper run on GitHub. So it stops before checking anything out, leaving nothing to save or publish.
+        self.started()
+        fence = self.fenced()
+        for action in ("tick", "start", "resume", "flatten"):
+            with self.subTest(action=action):
+                clone, outputs, result = self.job(action)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("::error title=The paper run is on Render::", result.stdout)
+                self.assertEqual(outputs, {})
+                self.assertFalse((clone / "state").exists())
+                self.assertEqual(self.tip("paper-state"), fence)
+        # Render backup keeps the service's copies on it, in data/render/.
+        clone, outputs, result = self.job("backup")
+        self.assertEqual(outputs, {"started": "true", "new": "false"}, result.stdout + result.stderr)
+        self.assertNotIn("::error", result.stdout)
+        self.assertNotIn("::warning", result.stdout)
+        # The note alone decides, so a database saved beside it doesn't make the branch Paper run's again.
+        write_state(clone / "state", "beside the note")
+        self.assertEqual(self.save(clone, "2026-11-06T15:23:00Z").returncode, 0)
+        beside = self.tip("paper-state")
+        for action in ("start", "tick"):
+            with self.subTest(action=action, database="beside the note"):
+                clone, outputs, result = self.job(action)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("::error title=The paper run is on Render::", result.stdout)
+                self.assertEqual(outputs, {})
+                self.assertFalse((clone / "state").exists())
+                self.assertEqual(self.tip("paper-state"), beside)
+        # Going back (RUNBOOK 13.9) takes the note away in the commit that puts the database back, and Paper run then
+        # carries on with it.
+        clone, _, _ = self.job("backup")
+        (clone / "state" / "data" / "MOVED_TO_RENDER.md").unlink()
+        self.assertEqual(self.save(clone, "2026-11-06T16:00:00Z").returncode, 0)
+        clone, outputs, result = self.job("tick")
+        self.assertEqual(outputs, {"started": "true", "new": "false"}, result.stdout + result.stderr)
+        self.assertEqual(rows(clone / "state" / "data" / "paper_systematic.db"), ["beside the note"])
+        self.assertNotIn("::", result.stdout)
+
+    def test_render_backup_with_no_paper_state_says_nothing_about_start(self):
+        # Its Pull step says what's wrong then. Paper run's notice, to start the run with action start, isn't for it.
+        clone, outputs, result = self.job("backup")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(outputs, {"started": "false", "new": "false"})
+        self.assertNotIn("::notice", result.stdout)
+        self.assertNotIn("action start", result.stdout)
+        self.assertFalse((clone / "state").exists())
+        self.assertFalse(self.has("paper-state"))
+
     def test_a_start_on_a_branch_that_lost_its_database_is_a_new_paper_run(self):
         # RUNBOOK 12.5: start begins a new run there. As on a new branch, a start that fails is then not kept.
         clone, _, _ = self.job("start")
@@ -323,14 +398,16 @@ def make_project(root: Path) -> None:
         "tests/sys_helpers.py": "", "tests/test_core.py": "", "config.toml": "mode = \"paper\"\n",
         "requirements.txt": "", "requirements-research.txt": "", "requirements-paper.txt": "",
         "README.md": "Put your key in .env as `ANTHROPIC_API_KEY=...`.\n", "RUNBOOK.md": "", "start.sh": "#!/bin/zsh\n",
-        "ops/actions/save_state.sh": "#!/usr/bin/env bash\n", "ops/publish_repo.py": "",
-        ".github/workflows/paper.yml": "name: Paper run\n",
+        ".python-version": "3.13\n", "ops/actions/save_state.sh": "#!/usr/bin/env bash\n", "ops/publish_repo.py": "",
+        "ops/render/serve.py": "", "ops/render/pull_backup.py": "", ".github/workflows/paper.yml": "name: Paper run\n",
+        ".github/workflows/render-backup.yml": "name: Render backup\n",
         # Never published:
         ".env": "ANTHROPIC_API_KEY=" + "x" * 8 + "\n", "data/paper_systematic.db": "state", "RESULTS.md": "",
         "AUDIT.md": "", "duo/AUDIT_STATUS.md": "", "research/PREREGISTRATION.md": "",
         "research/artifacts/variants.jsonl": "", "research/llm/calls.py": "", "research/tests/test_data.py": "",
         "tests/demo_server.py": "", ".claude/launch.json": "{}", ".venv/pyvenv.cfg": "", "duo/__pycache__/x.pyc": "",
-        "ops/com.duo.bot.plist": "", ".github/workflows/other.yml": "",
+        "ops/com.duo.bot.plist": "", "ops/render/__pycache__/serve.cpython-313.pyc": "",
+        ".github/workflows/other.yml": "",
     }
     for name, text in files.items():
         (root / name).parent.mkdir(parents=True, exist_ok=True)
@@ -349,8 +426,9 @@ PUBLISHED = {
     "research/strategies/f1_trend.py", "research/tools/__init__.py", "research/tools/fetch_binance.py",
     "research/artifacts/cost_model.json", "research/artifacts/cost_model.sha256", "tests/__init__.py",
     "tests/helpers.py", "tests/sys_helpers.py", "tests/test_core.py", "config.toml", "requirements.txt",
-    "requirements-research.txt", "requirements-paper.txt", "README.md", "RUNBOOK.md", "start.sh",
-    "ops/actions/save_state.sh", "ops/publish_repo.py", ".github/workflows/paper.yml", ".gitignore",
+    "requirements-research.txt", "requirements-paper.txt", "README.md", "RUNBOOK.md", "start.sh", ".python-version",
+    "ops/actions/save_state.sh", "ops/publish_repo.py", "ops/render/serve.py", "ops/render/pull_backup.py",
+    ".github/workflows/paper.yml", ".github/workflows/render-backup.yml", ".gitignore",
 }
 
 
@@ -484,7 +562,8 @@ class PublishRepo(unittest.TestCase):
         files, _ = publish_repo.publish(ROOT, target)
         for name in ("duo/__main__.py", "research/artifacts/cost_model.json", ".github/workflows/paper.yml",
                      "ops/actions/restore_state.sh", "ops/actions/save_state.sh", "requirements-paper.txt",
-                     "tests/test_actions_scripts.py"):
+                     "tests/test_actions_scripts.py", ".python-version", "ops/render/pull_backup.py",
+                     "ops/render/serve.py", "ops/render/ctl.py", ".github/workflows/render-backup.yml"):
             self.assertIn(name, files)
         for name in ("RESULTS.md", "AUDIT.md", "duo/AUDIT_STATUS.md", "tests/demo_server.py", ".env"):
             self.assertNotIn(name, files)

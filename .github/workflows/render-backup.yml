@@ -1,0 +1,187 @@
+# The paper test's copy on GitHub once it runs on Render, and the GitHub Pages page that sends readers there. README
+# says how the paper test runs on Render, and RUNBOOK section 13.7 how its backups reach GitHub.
+#
+# Since the cutover (RUNBOOK 13.3) the paper run lives on the service's disk, and Paper run (paper.yml) is disabled but
+# kept for going back. Each job downloads the service's latest backup, checks it's the run Render was seeded with and
+# no older than the last copy, and saves it on the paper-state branch in data/render/. It never runs the bot itself,
+# needs no keys or secrets, and never places an order.
+name: Render backup
+
+on:
+  schedule:
+    # This account's schedules start hours late, so four a day make sure at least one runs each day. The day's last
+    # save is that UTC day's commit.
+    - cron: '23 3,9,15,21 * * *'
+  workflow_dispatch:
+    inputs:
+      page:
+        description: >-
+          moved: GitHub Pages shows a page that takes readers to the service. final: it keeps a copy of the service's
+          own page, for the end of the test (RUNBOOK 13.8).
+        type: choice
+        options: [moved, final]
+        default: moved
+
+# Paper run's group, so the two never run at once, and its rules: none cancelled, halfway or while it waits, and every
+# waiting run kept, in order. Without queue: max GitHub cancels a waiting run in the group when another one queues.
+concurrency:
+  group: paper-run
+  cancel-in-progress: false
+  queue: max
+
+permissions: {}  # Each job asks for only what it needs.
+
+env:
+  RENDER_URL: https://duo-paper.onrender.com  # The service (RUNBOOK 13.2).
+  TZ: UTC
+
+jobs:
+  backup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15  # Room for three downloads, each tried three times, and the save.
+    permissions:
+      contents: write  # To push the paper-state branch. Nothing else is ever pushed.
+      actions: read    # To read Paper run's state.
+    outputs:
+      ran: ${{ steps.guard.outputs.ran }}
+      pulled: ${{ steps.pull.outputs.pulled }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # Before the cutover, and after going back (RUNBOOK 13.9), Paper run runs the test and writes paper-state
+      # itself: this mustn't be a second writer beside it. So it does nothing unless Paper run was disabled by hand,
+      # as the cutover does, and says so.
+      - name: Check Paper run is disabled
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          state=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/paper.yml" --jq .state)
+          if [ "$state" = disabled_manually ]; then
+            echo "ran=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=Paper run still runs the test::Paper run is $state, not disabled_manually, so the" \
+              "paper test still runs on GitHub and this did nothing. Render's backups are copied once the cutover" \
+              "has disabled it (RUNBOOK 13.3)."
+            echo "ran=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The backup must hold the run Render was seeded with, so it's checked against that database. paper-state's own
+      # copy went at the cutover, and the tag render-seed keeps the commit it came from (RUNBOOK 13.3).
+      - name: Fetch the seed
+        id: seed
+        if: steps.guard.outputs.ran == 'true'
+        run: |
+          if ! git fetch --quiet --no-tags --depth=1 origin "+refs/tags/render-seed:refs/tags/render-seed"; then
+            echo "::error::Couldn't fetch the tag render-seed, which marks the commit Render was seeded from" \
+              "(RUNBOOK 13.3). Without it the backup can't be checked, so nothing was saved."
+            exit 1
+          fi
+          git show "render-seed:data/paper_systematic.db" > "$RUNNER_TEMP/seed.db"
+          echo "sha=$(git rev-parse 'render-seed^{commit}')" >> "$GITHUB_OUTPUT"
+
+      # backup is the one action allowed on a paper-state fenced for Render (restore_state.sh). Like any action but
+      # start, it checks paper-state out as it is and never makes it, so this can't begin a new paper run.
+      - name: Restore the paper state
+        id: state
+        if: steps.guard.outputs.ran == 'true'
+        run: bash ops/actions/restore_state.sh state backup
+
+      # Nothing reaches paper-state until it checks out: each file against the manifest, the database's integrity,
+      # that it's the run Render was seeded with, and that it goes forwards from the last copy (pull_backup.py). Once
+      # it has, pulled tells the page's job.
+      - name: Pull the backup
+        id: pull
+        if: steps.guard.outputs.ran == 'true'
+        env:
+          STARTED: ${{ steps.state.outputs.started }}
+          SEED_SHA: ${{ steps.seed.outputs.sha }}
+        run: |
+          if [ "$STARTED" != true ]; then
+            echo "::error::There's no paper-state branch to save the backup on, and this never makes one. The" \
+              "cutover keeps paper-state (RUNBOOK 13.3), so look at what happened to it."
+            exit 1
+          fi
+          args=(--seed-db "$RUNNER_TEMP/seed.db" --seed-sha "$SEED_SHA")
+          if [ -f state/data/render/manifest.json ]; then
+            args+=(--previous state/data/render/manifest.json)
+          fi
+          python3 ops/render/pull_backup.py pull "$RENDER_URL" "$RUNNER_TEMP/backup" "${args[@]}"
+          echo "pulled=true" >> "$GITHUB_OUTPUT"
+
+      # Into data/render/, never data/ itself: a Paper run that ran by mistake stops at the fence's note there
+      # (restore_state.sh), and would find no database there either. The folder ends up holding this backup and
+      # nothing older.
+      - name: Copy it into the paper state
+        if: steps.guard.outputs.ran == 'true'
+        run: |
+          mkdir -p state/data/render
+          rm -f state/data/render/heartbeat_systematic.json
+          cp "$RUNNER_TEMP"/backup/* state/data/render/
+
+      - name: Save the paper state
+        if: steps.guard.outputs.ran == 'true'
+        run: bash ops/actions/save_state.sh state
+
+      # Last, and after a failure too, so you hear about the bot whatever happened to its copy. /ok answers 200 only
+      # while the bot runs and its checks and page are fresh (RUNBOOK 13.4). Anything else fails the job here, with the
+      # reason the service gives, and GitHub emails you. A blip is tried again first.
+      - name: Check the bot
+        if: always() && steps.guard.outputs.ran == 'true'
+        run: |
+          code=$(curl -sS --max-time 60 --retry 2 --retry-connrefused \
+            -o "$RUNNER_TEMP/ok.txt" -w '%{http_code}' "$RENDER_URL/ok") || true
+          if [ "$code" = 200 ]; then
+            echo "The bot is running normally: $RENDER_URL/ok answered 200."
+          elif [ "$code" = 000 ] || [ -z "$code" ]; then
+            echo "::error title=The bot needs you::$RENDER_URL/ok didn't answer, so the service may be down. Its" \
+              "Events and Logs on Render say why (RUNBOOK 13.4)."
+            exit 1
+          else
+            # The body is whatever answers at RENDER_URL. A bare CR in it would end this line for the runner, and what
+            # followed would run as a workflow command in this run, so control characters go, and % is escaped as
+            # workflow commands need.
+            reason=$(head -c 400 "$RUNNER_TEMP/ok.txt" 2>/dev/null | head -n 1 | tr -d '\000-\037\177' | cut -c 1-200)
+            reason=${reason//%/%25}
+            echo "::error title=The bot needs you::$RENDER_URL/ok answered $code: ${reason:-no reason given}." \
+              "RUNBOOK 13.4 says what to look at."
+            exit 1
+          fi
+
+  # The page at github.io. Only by hand, so a scheduled run never puts the moved page back over the end-of-test copy
+  # (RUNBOOK 13.8), and only once Paper run is disabled, so it never replaces the page Paper run publishes. The moved
+  # page goes up only after a pull that worked, so github.io never sends readers to an address that didn't serve this
+  # run's backup. final runs whatever the pull did, and after the bot check failed too: the bot is held at the end of
+  # the test.
+  pages:
+    needs: backup
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && needs.backup.outputs.ran == 'true' && (inputs.page == 'final' || needs.backup.outputs.pulled == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read   # To check the repository out: the job's token has only what's listed here.
+      pages: write     # To deploy the page.
+      id-token: write  # So Pages can check the deployment comes from this workflow.
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Build the page
+        env:
+          PAGE: ${{ inputs.page }}
+        run: |
+          if [ "$PAGE" = final ]; then
+            python3 ops/render/pull_backup.py page _site "$RENDER_URL" --final
+          else
+            python3 ops/render/pull_backup.py page _site "$RENDER_URL"
+          fi
+
+      - name: Upload the page
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1

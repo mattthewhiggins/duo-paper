@@ -1,5 +1,5 @@
-# The paper test, run by GitHub Actions so it carries on with the laptop shut down. README, "Running the paper test on
-# GitHub Actions", says how it works, and RUNBOOK section 12 how to run it.
+# The paper test, run by GitHub Actions with the laptop shut down, until the move to Render and again after going back
+# (RUNBOOK 13.9). README, "Running the paper test on GitHub Actions", says how it works, and RUNBOOK 12 how to run it.
 #
 # Every job is a fresh machine. It restores the paper run's state (data/, kept on the paper-state branch), runs one poll
 # of the systematic runner, saves the state, and publishes the status page to GitHub Pages. Paper only: it reads public

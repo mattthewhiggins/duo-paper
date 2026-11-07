@@ -1,8 +1,15 @@
-"""The paper run's status page for GitHub Pages: a folder of static files, rebuilt after every scheduled run.
+"""The paper run's status page: a folder of static files, rebuilt from the run's database by whichever host runs it.
 
-On GitHub Actions each run is a fresh machine: it restores the run's database, polls once, saves the database, then
-builds this folder and publishes it. build() reads the database through a second connection that can't write, so
-nothing here can change the run, and writes:
+It knows two hosts, and judges the run by the schedule of the one it's on:
+- cron, on GitHub Actions: each scheduled run is a fresh machine. It restores the run's database, polls once, saves the
+  database, then builds this folder and publishes it to GitHub Pages.
+- loop, on Render: python -m duo run, the laptop's own loop, runs nonstop beside the database on the service's disk,
+  and the service rebuilds this folder every 5 minutes and serves it.
+It's loop when the build is told so (--schedule loop) or the database has a heartbeat after the last tick (sys_tick_at,
+which only python -m duo tick writes), and cron otherwise.
+
+build() reads the database through a second connection that can't write, so nothing here can change the run, and
+writes:
 
 - status.json: everything the page shows. Every number is finite, and every time is given twice, as epoch seconds and
   as ISO 8601 UTC under the same name + _utc.
@@ -13,8 +20,12 @@ nothing here can change the run, and writes:
 The figures are the runner's own records: the start record (state key sys_start), heartbeats, decisions, orders and
 fills, and for the hold-BTC comparison the engine's benchmark_qty and snapshots. Nothing here calls an exchange.
 
-python -m duo site --out DIR builds it from the database config.toml points at, as the workflow does. python -m duo.site
---out DIR does the same and reads config.toml alone, never .env.
+python -m duo site --out DIR builds it from the database config.toml points at, as the GitHub workflow does. That
+command also opens the database read-write (DB()) and checkpoints it on the way out (PRAGMA wal_checkpoint(TRUNCATE)),
+which is fine where nothing else runs, and never beside a live loop. python -m duo.site --out DIR [--schedule loop]
+builds the same page from config.toml alone, never .env, and opens the database read only: it's the build to run beside
+a live loop, as Render's service does. With --schedule loop and no database yet, as on Render before the cutover, it
+writes a page that says so.
 """
 from __future__ import annotations
 
@@ -42,15 +53,18 @@ from .systematic import DAY, day_start, export_decisions
 
 PAGE = Path(__file__).parent / "static" / "site.html"
 TARGET_DAYS = 28                # The finished days compared the owner set out to watch (RUNBOOK section 1).
-STALE_MINUTES = 195             # The page calls itself stale past this: an hourly slot, a skipped run and an hour of
-                                # GitHub's delay (180, the runner's cron_gap_minutes), plus the build and the deploy.
+STALE_MINUTES = 195             # On GitHub the page calls itself stale past this: an hourly slot, a skipped run and an
+                                # hour of GitHub's delay (180, the runner's cron_gap_minutes), plus the build and the
+                                # deploy. On Render it's rebuilt every loop, so it's heartbeat_stale_minutes and a loop.
+HOLD_FILE = "HOLD"              # On Render the bot stays stopped while this is in the data folder (RUNBOOK 13.6).
+SEED_FILE = "render_seed.json"  # Render's seed marker, in the data folder: where GitHub's runs ended, at the cutover.
 MAX_CHART_POINTS = 500          # Past this, every Nth run is drawn, and each day's last.
 RECENT_DECISIONS = 10
 RECENT_ORDERS = 10
 RECENT_FILLS = 30
 COMPARE_DAYS = 14
 SNAPSHOT_MATCH_SECONDS = 600    # A snapshot this close to a heartbeat prices holding BTC at that heartbeat.
-# The workflow's cron lines, in UTC. Copied from it by hand, so the page can say when the next run is due.
+# The GitHub workflow's cron lines, in UTC. Copied from it by hand, so the page can say when the next run is due.
 SCHEDULE = ("5,20,35,50 0-3 * * *", "35 4-23 * * *", "47 23 * * *")
 SYMBOLS = {"USD": "$", "GBP": "£", "EUR": "€"}
 
@@ -87,6 +101,28 @@ NOTES = {
         "if the price traded through it. The laptop checked live quotes every 10 seconds.",
         "The risk checks (kill switch, daily loss limit, stale data) run once per run, not every 5 minutes, so a move "
         "between runs is only acted on at the next one.",
+    ],
+}
+# The same notes on Render, where the laptop's own loop runs: its schedule, and the little that differs from the laptop.
+NOTES_LOOP = {
+    **NOTES,
+    "schedule": "It runs nonstop on a Render web service, as it ran on the laptop: python -m duo run checks Kraken's "
+                "prices every 10 seconds and runs the strategy's loop every 5 minutes from 00:02 UTC, with a heartbeat "
+                "each time. The database stays on the service's disk, and the service rebuilds this page from it, read "
+                "only, every 5 minutes.",
+    "differences": [
+        "The daily decision, the fills and the risk checks work as on the laptop: the decision is made at the first "
+        "loop from 00:02 UTC, a resting order is checked against Kraken's live quotes every 10 seconds, and the kill "
+        "switch, daily loss limit and stale data checks run every 5 minutes.",
+        "Its dashboard can't be reached, so halting, flattening and resuming are typed in the service's Shell on "
+        "Render (RUNBOOK section 13.5).",
+        "Render stops and restarts the service for deploys and maintenance. A gap of over 11 minutes between checks "
+        "counts as an outage: a resting order from before it closes unfilled, as nothing watched it in between.",
+        "A failed request to Kraken counts at each 10-second check, so about 50 seconds of Kraken errors in a row "
+        "stops new orders until it answers again.",
+        "GBP/USD is read with each day's decision, so the figures in pounds follow it once a day.",
+        "The days before the move ran on GitHub Actions, once per scheduled run: the decision at the first run after "
+        "00:02 UTC, resting orders judged on Kraken's 1-minute candles, and the risk checks once per run.",
     ],
 }
 
@@ -300,13 +336,14 @@ def _start(config: Config, start: dict, now: float) -> dict:
     }
 
 
-def _strategy(ro: ReadOnlyDB, start: dict) -> dict:
+def _strategy(ro: ReadOnlyDB, start: dict, loop: bool) -> dict:
     latest = ro.one("SELECT signal_source FROM sys_decisions ORDER BY id DESC LIMIT 1") \
         if "sys_decisions" in ro.tables else None
     return {
         "id": start["strategy_id"], "family": start.get("family"), "params": start.get("params") or {},
         "description": describe(start),
-        "decides": "Once a day, at the first run after 00:02 UTC, on the daily bar that closed at 00:00 UTC.",
+        "decides": f"Once a day, at {'the first loop from' if loop else 'the first run after'} 00:02 UTC, on the daily "
+                   f"bar that closed at 00:00 UTC.",
         "signal_source": latest["signal_source"] if latest else None,
         "price_source": "Kraken's public BTC/USD prices, for the paper fills and the account's value.",
         "notes": start.get("notes") or [],
@@ -496,24 +533,32 @@ def _chart(ro: ReadOnlyDB, start: dict, valuation: dict) -> dict:
     }
 
 
-def _today(config: Config, ro: ReadOnlyDB, now: float) -> dict:
+def _today(config: Config, ro: ReadOnlyDB, now: float, loop: bool) -> dict:
     day = day_start(now)
     settle = day + _setting(config, "settle_minutes") * 60
     last = ro.one("SELECT day_ts FROM sys_decisions ORDER BY day_ts DESC LIMIT 1") \
         if "sys_decisions" in ro.tables else None
     decided = last is not None and last["day_ts"] >= day - DAY
     halted = ro.get("sys_kill") == "1"  # No decision is made while the kill switch is on, until it's resumed.
-    # Overdue from when the heartbeat counts it for a scheduled run (python -m duo tick), as the runs that build this
-    # page are, so the page and the watchdog agree.
-    grace = max(_setting(config, "signal_stale_minutes"), _setting(config, "cron_decision_grace_minutes"))
+    # Overdue from when the heartbeat counts it, so the page and the watchdog agree: for a scheduled run (python -m duo
+    # tick), as GitHub's runs are, after the scheduler's grace too; for the loop, from signal_stale_minutes alone. The
+    # loop's heartbeat counts it at its own time, which is what the watchdog reads, so it's overdue here only once the
+    # loop has checked since: a page built while the loop is held or stopped doesn't call it overdue or say the loop has
+    # checked since it was due.
+    grace = _setting(config, "signal_stale_minutes")
+    if not loop:
+        grace = max(grace, _setting(config, "cron_decision_grace_minutes"))
     late_from = day + grace * 60
-    overdue = (now - late_from) / 60 if not decided and not halted and now > late_from else None
+    newest = ro.one("SELECT MAX(ts) AS ts FROM sys_heartbeats")["ts"] \
+        if loop and "sys_heartbeats" in ro.tables else None
+    checked = not loop or (newest is not None and newest > late_from)
+    overdue = (now - late_from) / 60 if not decided and not halted and now > late_from and checked else None
     return {"bar_date": _date(day - DAY), **_at("bar_at", day - DAY), "decided": decided, "halted": halted,
             **_at("due_from", None if halted else settle + DAY if decided else settle),
             **_at("overdue_from", late_from), "overdue_minutes": overdue}
 
 
-def _order(config: Config, ro: ReadOnlyDB, row, quote: str) -> dict:
+def _order(config: Config, ro: ReadOnlyDB, row, quote: str, loop: bool) -> dict:
     fills = ro.all("SELECT f.liquidity, f.qty, f.gross, f.fee FROM fills f JOIN sys_children c ON c.venue_id = "
                    "f.venue_id WHERE c.order_id = ? AND f.source = 'systematic' ORDER BY f.id", (row["id"],))
     resting = ro.one("SELECT limit_price, placed_at FROM sys_children WHERE order_id = ? AND status = 'open' "
@@ -524,8 +569,9 @@ def _order(config: Config, ro: ReadOnlyDB, row, quote: str) -> dict:
     fees = sum((D(f["fee"]) for f in fills), Decimal(0))
     maker = sum(f["liquidity"] == "maker" for f in fills)
     average = gross / qty if qty > 0 else None
-    # A scheduled run switches to taker cron_slack_seconds early, at the first run from then (systematic.py's _work).
-    taker_after = _setting(config, "taker_after_minutes") * 60 - _setting(config, "cron_slack_seconds")
+    # A scheduled run switches to taker cron_slack_seconds early, at the first run from then, and the loop on time
+    # (systematic.py's _work).
+    taker_after = _setting(config, "taker_after_minutes") * 60 - (0 if loop else _setting(config, "cron_slack_seconds"))
     working = row["status"] == "working" and row["source"] != "kill_switch"
     taker_from = row["created_at"] + taker_after if working else None
     status, asset, note = row["status"], row["asset"], row["note"]
@@ -597,7 +643,7 @@ def _average(closes: list, params: dict) -> float | None:
     return sum(window) / length  # In order, as research/strategies/common.py's rolling_mean adds them.
 
 
-def _decisions(config: Config, ro: ReadOnlyDB, start: dict) -> list[dict]:
+def _decisions(config: Config, ro: ReadOnlyDB, start: dict, loop: bool) -> list[dict]:
     params, quote = start.get("params") or {}, start.get("quote", "USD")
     out = []
     for row in ro.all("SELECT * FROM sys_decisions ORDER BY day_ts DESC LIMIT ?", (RECENT_DECISIONS,)):
@@ -624,18 +670,18 @@ def _decisions(config: Config, ro: ReadOnlyDB, start: dict) -> list[dict]:
             "target_weight": target, "weight_before": before, "band": _n(bands.get(asset)),
             "equity": _dec(row["equity"]),
             "summary": _summary(intended, asset, target, before, _n(bands.get(asset)) or 0.0, on, quote),
-            "orders": [_order(config, ro, o, quote) for o in orders],
+            "orders": [_order(config, ro, o, quote, loop) for o in orders],
             "untradable": json.loads(row["untradable"] or "[]"), "notes": row["notes"],
             "signal_source": row["signal_source"],
         })
     return out
 
 
-def _orders(config: Config, ro: ReadOnlyDB, start: dict) -> list[dict]:
+def _orders(config: Config, ro: ReadOnlyDB, start: dict, loop: bool) -> list[dict]:
     rows = ro.all("SELECT * FROM sys_orders ORDER BY id DESC LIMIT ?", (RECENT_ORDERS,))
     out = []
     for row in rows:
-        order = _order(config, ro, row, start.get("quote", "USD"))
+        order = _order(config, ro, row, start.get("quote", "USD"), loop)
         bar = ro.one("SELECT day_ts FROM sys_decisions WHERE id = ?", (row["decision_id"],)) \
             if row["decision_id"] is not None else None
         order["bar_date"] = _date(bar["day_ts"]) if bar else None
@@ -666,9 +712,12 @@ def _fill_totals(ro: ReadOnlyDB, start: dict) -> dict:
     }
 
 
-def _runs(ro: ReadOnlyDB, start: dict, now: float) -> dict:
+def _runs(ro: ReadOnlyDB, start: dict, now: float, host: dict) -> dict:
     """Each run is one poll and writes one heartbeat, so heartbeats count the runs. Over a window they're counted from
-    the same time as its scheduled slots: strictly after the start, whose own run isn't one of them."""
+    the same time as its scheduled slots: strictly after the start, whose own run isn't one of them. On Render the
+    loop's checks are counted against its own grid instead (_loop_runs)."""
+    if host["schedule"] == "loop":
+        return _loop_runs(ro, start, now, host)
     started = float(start["started_at"])
     since = lambda span: max(now - span, started)
     count = lambda after: ro.one("SELECT COUNT(*) AS n FROM sys_heartbeats WHERE ts > ? AND ts <= ?",
@@ -694,6 +743,44 @@ def _runs(ro: ReadOnlyDB, start: dict, now: float) -> dict:
                      "per_day": len(slots), "text": NOTES["schedule"],
                      "summary": "Every 15 minutes from 00:05 to 03:50 UTC, hourly at 35 minutes past from 04:35 to "
                                 "23:35, and at 23:47."},
+    }
+
+
+def _loop_runs(ro: ReadOnlyDB, start: dict, now: float, host: dict) -> dict:
+    """The loop's checks (one heartbeat each) against the grid it keeps: one every loop_minutes from 00:00 UTC +
+    settle_minutes, as next_loop_after has it. Both are counted from the move at the earliest, since nothing before it
+    was the loop's, and the move's own gap isn't a gap between checks. A start or restart adds one check off the grid,
+    straight away, and the page says so."""
+    period, offset, moved = host["loop_minutes"] * 60, host["settle_minutes"] * 60, host["moved_at"]
+    grid = lambda ts: math.floor((ts - offset) / period)  # The grid points up to ts, counted from the epoch.
+    since = lambda span: None if moved is None else max(now - span, float(start["started_at"]), moved)
+    count = lambda after: 0 if after is None else ro.one(
+        "SELECT COUNT(*) AS n FROM sys_heartbeats WHERE ts >= ? AND ts <= ?", (after, now))["n"]
+    due = lambda after: 0 if after is None else max(0, grid(now) - grid(after))
+    last = ro.one("SELECT ts, status FROM sys_heartbeats ORDER BY ts DESC LIMIT 1")
+    first = ro.one("SELECT MIN(ts) AS ts, COUNT(*) AS n FROM sys_heartbeats")
+    times = []
+    if moved is not None:
+        recent = [r["ts"] for r in ro.all("SELECT ts FROM sys_heartbeats WHERE ts > ? AND ts >= ? AND ts <= ? "
+                                          "ORDER BY ts", (now - DAY, moved, now))]
+        before = ro.one("SELECT ts FROM sys_heartbeats WHERE ts <= ? AND ts >= ? ORDER BY ts DESC LIMIT 1",
+                        (now - DAY, moved))
+        times = ([before["ts"]] if before else []) + recent
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    settle = host["settle_minutes"]
+    return {
+        **_at("last_at", last["ts"] if last else None), "last_status": last["status"] if last else None,
+        **_at("first_at", first["ts"]), "total": first["n"],
+        "last_24h": count(since(DAY)), "scheduled_24h": due(since(DAY)),
+        "last_7d": count(since(7 * DAY)), "scheduled_7d": due(since(7 * DAY)),
+        "since_move_24h": moved is not None and since(DAY) == moved,  # The window was cut at the move.
+        "since_move_7d": moved is not None and since(7 * DAY) == moved,
+        "longest_gap_24h_minutes": max(gaps) / 60 if gaps else None,
+        "scheduled_longest_gap_minutes": host["loop_minutes"],
+        **_at("next_expected_at", (grid(now) + 1) * period + offset),
+        "schedule": {"cron": [], "slots_utc": [], "per_day": 1440 // host["loop_minutes"],
+                     "text": NOTES_LOOP["schedule"],
+                     "summary": f"Every {host['loop_minutes']} minutes, from {settle // 60:02d}:{settle % 60:02d} UTC"},
     }
 
 
@@ -732,16 +819,67 @@ def _attempt(status: dict, name: str, make, *args):
         return None
 
 
-def gather(config: Config, ro: ReadOnlyDB, now: float) -> dict:
-    """Everything status.json holds except the files written beside it."""
-    start = _loads(ro.get("sys_start"))
+def _host(config: Config, ro: ReadOnlyDB | None, schedule: str | None) -> dict:
+    """Which host runs the run, whose schedule the page judges it by, and where it moved from GitHub to Render.
+
+    It's loop when the build says so (schedule) or the database has a heartbeat after the last tick, and cron
+    otherwise. A tick records sys_tick_at before anything else and its heartbeat has that same ts, so the heartbeats up
+    to it are GitHub's and those after it the loop's. Render's seed marker records that switch once, at the cutover,
+    and comes first: a tick run later would move sys_tick_at. ro is None when there's no database yet.
+    """
+    data, beats = Path(config.data_dir), ro is not None and "sys_heartbeats" in ro.tables
+    seed = _loads(_read(data / SEED_FILE))
+    seed = seed if isinstance(seed, dict) else None
+    tick_at = _n(seed.get("sys_tick_at")) if seed is not None else _n(ro.get("sys_tick_at")) if ro is not None else None
+    if seed is not None:
+        last_cron, cron_runs = _n(seed.get("last_cron_at")), seed.get("cron_runs")
+    elif beats and tick_at is not None:
+        row = ro.one("SELECT MAX(ts) AS ts, COUNT(*) AS n FROM sys_heartbeats WHERE ts <= ?", (tick_at,))
+        last_cron, cron_runs = row["ts"], row["n"]
+    else:
+        last_cron = cron_runs = None
+    latest = ro.one("SELECT MAX(ts) AS ts FROM sys_heartbeats")["ts"] if beats else None
+    if schedule is None:
+        schedule = "loop" if tick_at is not None and latest is not None and latest > tick_at else "cron"
+    loop = schedule == "loop"
+    # The loop's first check: the first heartbeat after GitHub's last, or the first of all if GitHub never ran it.
+    moved = ro.one("SELECT MIN(ts) AS ts FROM sys_heartbeats WHERE ts > ?",
+                   (-math.inf if last_cron is None else last_cron,))["ts"] if loop and beats else None
+    hold = data / HOLD_FILE
+    held = hold.exists() if loop else None
+    try:
+        held_since = hold.stat().st_mtime if held else None
+    except OSError:  # Taken off since: the next build says so.
+        held_since = None
+    loop_minutes = _setting(config, "loop_minutes")
+    return {
+        "schedule": schedule, "name": "Render" if loop else "GitHub Actions",
+        "loop_minutes": loop_minutes, "settle_minutes": _setting(config, "settle_minutes"),
+        "beat_late_minutes": 2 * loop_minutes + 1,  # The runner's own outage rule: two loops and a minute.
+        "beat_stale_minutes": _setting(config, "heartbeat_stale_minutes"),  # The watchdog calls the bot down past it.
+        **_at("last_cron_at", last_cron), **_at("moved_at", moved),
+        "cron_runs": cron_runs if type(cron_runs) is int else None,
+        "move_gap_minutes": None if moved is None or last_cron is None else (moved - last_cron) / 60,
+        "held": held, **_at("held_since", held_since),
+        "seed_sha": seed.get("sha") if loop and seed is not None and isinstance(seed.get("sha"), str) else None,
+    }
+
+
+def gather(config: Config, ro: ReadOnlyDB | None, now: float, schedule: str | None = None) -> dict:
+    """Everything status.json holds except the files written beside it. ro is None when there's no database yet, as on
+    Render before the cutover, and schedule is the host's when the build knows it (_host)."""
+    start = _loads(ro.get("sys_start")) if ro is not None else None
+    host = _host(config, ro, schedule)
+    loop = host["schedule"] == "loop"
     status = {
-        "schema": 1, "title": "Duo paper run", **_at("generated_at", now), **_at("tick_at", ro.get("sys_tick_at")),
-        "mode": config.mode,
-        "stale_after_minutes": STALE_MINUTES, "target_days": TARGET_DAYS,
+        "schema": 1, "title": "Duo paper run", **_at("generated_at", now),
+        **_at("tick_at", ro.get("sys_tick_at") if ro is not None else None), "mode": config.mode, "host": host,
+        # On Render the page is rebuilt every loop: it's stale once the watchdog would call the bot down, and a loop on.
+        "stale_after_minutes": host["beat_stale_minutes"] + host["loop_minutes"] if loop else STALE_MINUTES,
+        "target_days": TARGET_DAYS,
         "strategy": None, "start": None, "heartbeat": None, "today": None, "holdings": None, "equity": None,
         "hold_btc": None, "chart": None, "decisions": [], "orders": [], "fills": [], "fill_totals": None,
-        "runs": None, "compare": None, "files": None, "notes": NOTES, "errors": {},
+        "runs": None, "compare": None, "files": None, "notes": NOTES_LOOP if loop else NOTES, "errors": {},
     }
     if not isinstance(start, dict):
         return status  # No paper run yet, and the page says so.
@@ -753,7 +891,7 @@ def gather(config: Config, ro: ReadOnlyDB, now: float) -> dict:
         return value
 
     section("start", _start, config, start, now)
-    section("strategy", _strategy, ro, start)
+    section("strategy", _strategy, ro, start, loop)
     section("fill_totals", _fill_totals, ro, start)
     section("fills", _fills, ro)
     fx = _attempt(status, "gbp_usd", _fx, ro, start)
@@ -766,27 +904,31 @@ def gather(config: Config, ro: ReadOnlyDB, now: float) -> dict:
             section("hold_btc", _hold_btc, ro, start, valuation, equity, fx)
     if {"sys_decisions", "sys_orders", "sys_children", "sys_heartbeats"} <= ro.tables:  # Once prepare() has run.
         section("heartbeat", _heartbeat, config, ro)
-        section("today", _today, config, ro, now)
-        section("decisions", _decisions, config, ro, start)
-        section("orders", _orders, config, ro, start)
-        section("runs", _runs, ro, start, now)
+        section("today", _today, config, ro, now, loop)
+        section("decisions", _decisions, config, ro, start, loop)
+        section("orders", _orders, config, ro, start, loop)
+        section("runs", _runs, ro, start, now, host)
     return status
 
 
-def build(config: Config, db: DB | ReadOnlyDB, out_dir: Path, now: float | None = None) -> dict:
+def build(config: Config, db: DB | ReadOnlyDB | None, out_dir: Path, now: float | None = None,
+          schedule: str | None = None) -> dict:
     """Writes the site into out_dir and returns what status.json holds.
 
-    Only db's path is used: the database is opened again, read only, so the run can't be changed from here.
+    Only db's path is used: the database is opened again, read only, so the run can't be changed from here. db is None
+    when there's no database yet, as on Render before the cutover, and the page then says there's no paper run.
+    schedule ("cron" or "loop") is the host's, when the caller knows it; otherwise the database says (_host).
     """
     now = time.time() if now is None else now
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    ro = ReadOnlyDB(db.path)
+    ro = ReadOnlyDB(db.path) if db is not None else None
     try:
-        ro.conn.execute("BEGIN")  # One read transaction, so every figure is from the same moment even mid-write.
-        status = gather(config, ro, now)
+        if ro is not None:
+            ro.conn.execute("BEGIN")  # One read transaction, so every figure is from the same moment even mid-write.
+        status = gather(config, ro, now, schedule)
         report = decisions = decisions_error = None
-        if isinstance(_loads(ro.get("sys_start")), dict):
+        if ro is not None and isinstance(_loads(ro.get("sys_start")), dict):
             status["compare"], report = _compare(ro)
             decisions, decisions_error = _decisions_export(ro)
             if status["start"]:  # The 28 days are finished days compared, as RUNBOOK section 1 counts them.
@@ -795,7 +937,8 @@ def build(config: Config, db: DB | ReadOnlyDB, out_dir: Path, now: float | None 
         else:
             status["compare"] = {"ok": False, "error": None, "summary": {}, "notes": ["No paper run yet."], "days": []}
     finally:
-        ro.close()
+        if ro is not None:
+            ro.close()
     _put(out / "compare.md", report)
     _put(out / "decisions.jsonl", decisions)
     status["files"] = {"page": "index.html", "status": "status.json",
@@ -823,6 +966,10 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(prog="python -m duo.site",
                                      description="Builds the paper run's status page from its database, read only.")
     parser.add_argument("--out", default="site", help="the folder to write (default: site)")
+    parser.add_argument("--schedule", choices=("cron", "loop"),
+                        help="the host's schedule, to judge the run by: cron for GitHub Actions' scheduled runs, loop "
+                             "for Render's nonstop loop (default: loop if the database has a heartbeat after the last "
+                             "tick, else cron)")
     args = parser.parse_args(argv)
     try:
         config = config_module.load()  # config.toml only: the page needs no keys, so .env is never read.
@@ -831,10 +978,15 @@ def main(argv=None) -> None:
     if not config.systematic_on:
         sys.exit("The systematic runner is off in config.toml ([systematic] enabled = false).")
     if not config.db_path.exists():
-        sys.exit(f"No systematic paper run yet: {config.db_path} doesn't exist.")
+        if args.schedule != "loop":
+            sys.exit(f"No systematic paper run yet: {config.db_path} doesn't exist.")
+        # Render before the cutover: a page that says there's no run on the disk yet, rather than no page at all.
+        build(config, None, Path(args.out), schedule=args.schedule)
+        print(f"Status page written to {args.out}, saying there's no paper run yet: {config.db_path} doesn't exist.")
+        return
     reader = ReadOnlyDB(config.db_path)  # Not DB(): that one can write, and this command never needs to.
     try:
-        status = build(config, reader, Path(args.out))
+        status = build(config, reader, Path(args.out), schedule=args.schedule)
     finally:
         reader.close()
     print(f"Status page written to {args.out}." + "".join(f"\n- {p}" for p in problems(status)))

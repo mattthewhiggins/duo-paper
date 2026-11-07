@@ -13,7 +13,7 @@ It starts in **paper mode**: live Kraken prices, simulated fills, no real money.
 
 To see the dashboard without a key, run `.venv/bin/python -m tests.demo_server` and open http://127.0.0.1:8799. It uses live prices with a scripted conversation and invented chart history, and it never touches your real data. The demo server is in the private working copy only; the public repository leaves it out.
 
-`start.sh` keeps the Mac awake while it runs, but closing the lid can still put it to sleep. **While the bot is stopped or asleep, no stop-losses run**, which is why it should move to a server before using real money. To run the paper test with the laptop shut down, see "Running the paper test on GitHub Actions" below.
+`start.sh` keeps the Mac awake while it runs, but closing the lid can still put it to sleep. **While the bot is stopped or asleep, no stop-losses run**, which is why it should move to a server before using real money. To run the paper test with the laptop shut down, see "Running the paper test on Render" below: it runs on GitHub Actions until the cutover to Render, and on a Render web service from then on.
 
 ## The systematic runner
 
@@ -40,7 +40,7 @@ To see the dashboard without a key, run `.venv/bin/python -m tests.demo_server` 
 | Kill switch | 45% below peak equity, marked only at sane, fresh, moving quotes | Everything cancelled and sold at market (capped), then halted until you resume. It fires even while trading is paused from the dashboard |
 | Stale data or errors | Daily bar missing 30 minutes after 00:00, a quote over 90 seconds old or frozen for 10 minutes, or 5 API errors in a row | No new orders until it clears, which it does by itself |
 
-**Resuming after the kill switch** (or after Stop trading on the dashboard): press **Resume** in the dashboard's Systematic runner panel, or run `.venv/bin/python -m duo resume`. The drawdown peak restarts from equity at that moment. On GitHub Actions, run the Paper run workflow with action `resume` instead (RUNBOOK 12.3): the dashboard and `duo resume` only reach the Mac's own paper run. Nothing else needs you: every other halt clears on its own.
+**Resuming after the kill switch** (or after Stop trading on the dashboard): press **Resume** in the dashboard's Systematic runner panel, or run `.venv/bin/python -m duo resume`. The drawdown peak restarts from equity at that moment. On Render, type `python3 ops/render/ctl.py resume` in the service's Shell instead, which runs `python -m duo resume` on the service's disk (RUNBOOK 13.5). On GitHub Actions, before the move or after going back, run the Paper run workflow with action `resume` (RUNBOOK 12.3). The Mac's dashboard and `duo resume` only reach the Mac's own paper run. Nothing else needs you: every other halt clears on its own.
 
 **What's recorded.** Every decision is a row with everything needed to audit it: the time, the strategy, the research code hash, the signal source and a hash of the bars, the last 300 closes per asset, signals, targets, bands, holdings, the orders it meant to place, and each limit's value, threshold and outcome. Orders, child orders and fills link back to it. Every loop writes a heartbeat.
 
@@ -49,11 +49,12 @@ To see the dashboard without a key, run `.venv/bin/python -m tests.demo_server` 
 | `.venv/bin/python -m duo status` | Strategy, last heartbeat, last decision, halts. No network |
 | `.venv/bin/python -m duo decisions` | Every decision, with its orders and fills, as JSONL in `data/decisions_systematic.jsonl` |
 | `.venv/bin/python -m duo compare` | Paper against the research backtest of the same decisions, in `data/compare_systematic.md` |
-| `.venv/bin/python -m duo watchdog` | Is the bot alive, and is the Mac on mains power? |
+| `.venv/bin/python -m duo watchdog` | Is the bot alive, and is the Mac on mains power? On Render, which isn't a Mac, it prints `Power: not checked`, and its pass or fail is part of the service's `/ok` |
 | `.venv/bin/python -m duo resume` | Lifts the kill switch |
-| `.venv/bin/python -m duo tick` | One poll, then exits: what each GitHub Actions run does. It never starts a new paper run unless given `--first-run`; `--flatten` sells everything and halts |
+| `.venv/bin/python -m duo tick` | One poll, then exits: what each GitHub Actions run does. It never starts a new paper run unless given `--first-run`; `--flatten` sells everything and halts. Never on Render, beside the loop (RUNBOOK 13.10) |
 | `.venv/bin/python -m duo probe` | Can this machine reach Kraken's and Binance's public prices? Changes nothing |
-| `.venv/bin/python -m duo site --out DIR` | Writes the static status page into DIR |
+| `.venv/bin/python -m duo site --out DIR` | Writes the static status page into DIR. It opens the database writable and checkpoints it as it closes, so never beside a running loop |
+| `.venv/bin/python -m duo.site --out DIR` | The same page, reading the database only: the build Render's supervisor runs beside the loop (with `--schedule loop`) |
 
 **Paper against backtest.** `compare` re-runs the research engine (`backtest_weights`, or `dca` for the DCA fallback) on the same signal data and targets, with the research cost model at Tier 3 taker. It shows, per order, the backtest's assumed fill (the next day's open plus its cost at that size) against the paper fill and fee; per day, paper's return against the backtest's, the difference, its mean and tracking error; and how many fills were maker. The dashboard shows the same. After at least 4 weeks, this is what says whether paper behaved as the research expected. It can't say whether the strategy has an edge: 4 weeks is far too short for that.
 
@@ -67,19 +68,44 @@ A Mac on battery can sleep or run flat, and the bot then stops with no alert (au
 
 While the bot is stopped or the Mac is asleep, nothing is checked or traded, and in paper nothing fills.
 
+On Render (below), none of this is needed: the supervisor starts the bot again when it stops, Render starts the service again, and the watchdog's verdict is the service's `/ok`. This section is for the Mac.
+
+## Running the paper test on Render
+
+The paper test runs on a Render web service from the cutover on (RUNBOOK 13.3), so it carries on with the laptop shut down, and it runs the laptop's own loop rather than one poll per scheduled run. Before the cutover it runs on GitHub Actions (below), and it can go back there (RUNBOOK 13.9). RUNBOOK section 13 is the step-by-step guide.
+
+- **How:** the service's start command is `python -u ops/render/serve.py`, a supervisor that uses Python's standard library only. It serves the status page on Render's port, and runs the bot, `python -m duo run`, as its child, on the service's disk (`DUO_DATA_DIR=/var/data`). `python -m duo run` starts a new paper run on any database without one, so the supervisor starts the bot only once the disk holds this run, seeded from GitHub: it checks the disk, the HOLD file, the start record against `config.toml` (with the runner on), the seed's marker, the bot's port and its own lock first, and says why it's waiting if one fails. It starts the bot again if it stops. 45 seconds after each 5-minute loop it rebuilds the page with `python -m duo.site`, which only reads the database, then runs the watchdog.
+- **Where:** the service `duo-paper`, in Frankfurt, at **https://duo-paper.onrender.com/**. Like the repository, it's public: anyone can see the paper trades. https://mattthewhiggins.github.io/duo-paper/ then shows a page that takes readers there.
+- **When:** as on the laptop: Kraken's prices every 10 seconds, the strategy's loop every 5 minutes, and the day's decision at the first loop from 00:02 UTC.
+- **The state:** the database and the heartbeat file on the service's 1 GB disk, at `/var/data`. The supervisor backs the database up at the seed, after the loop's first check, every 6 hours and when asked, keeps the newest 8, and serves the latest at `/state/`. The **Render backup** workflow (`.github/workflows/render-backup.yml`) copies it four times a day into `data/render/` on the `paper-state` branch, one commit per UTC day.
+- **Using it:** in the service's Shell on Render, `cd /opt/render/project/src` and then `python3 ops/render/ctl.py` with `status`, `events` (the bot's event log, which the dashboard shows as its Activity list), `probe`, `resume`, `halt` (as Stop trading), `flatten` (sells everything at the next loop, then halts), `hold` and `unhold` (stop the bot and keep it stopped, for a deploy, and let it start again), `backup` or `check`. `seed`, run once, is the cutover, and stands in for the workflow's `start`. There's no Run workflow.
+- **Checking on it:** the status page, rebuilt every 5 minutes, says "Running normally", "Needs attention" (no check for over 11 minutes, today's decision overdue from 00:30 UTC, or the runner not trading normally), "Halted", "Held", "Stale" (no check for over 15 minutes, or the page itself over 20 minutes old) or "Finished". https://duo-paper.onrender.com/ok answers 200 only while the bot runs and the watchdog's last pass and the page are both under 10 minutes old, and 503 with the reason otherwise.
+- **Alerts:** Render emails you when a deploy fails, when the service becomes unhealthy (its health check, `/healthz`, fails for about a minute, and Render restarts it), when the disk is over 80% full, and when it suspends the service after it repeatedly failed to start, with notice of maintenance too. GitHub emails you when a Render backup run fails, including when its last step finds `/ok` isn't 200: that's the alert for a halted, stopped or stale bot, but this account's schedules start hours late, so it can come hours after the cause. A monitor outside Render on `/ok` (RUNBOOK 13.4) is quicker.
+- **Stopping it:** the loop doesn't stop by itself. The 28-day test is complete with the decision at the first loop from 00:02 UTC on 3 December 2026, and RUNBOOK 13.8 ends it: a hold, a final backup copied to GitHub with the final page on github.io, and deleting the service.
+
+How it differs from the laptop: hardly at all, since it runs the laptop's own loop.
+
+- **Deploys, restarts and Render's maintenance** stop the bot (SIGTERM, with about 20 seconds to finish its loop) and start it again on a new instance. A gap of over 11 minutes between checks counts as an outage and closes resting orders from before it unfilled, so deploys are made by hand, never from 00:00 to 00:10 UTC and never while an order is working (RUNBOOK 13.6).
+- **No dashboard to open.** It runs inside the service on 127.0.0.1:8787, which only `ctl.py` in the Shell reaches. The public page is the static status page.
+- **Daily bars** come from Binance's market-data host, data-api.binance.vision, first, as on GitHub (below). Each decision records which host it used.
+
+**Costs:** the Starter instance (0.5 CPU, 512 MB) at $7 a month and the 1 GB disk at $0.25 a month (render.com/pricing), charged while the service exists. Render also meters outbound bandwidth for the whole account: the Hobby plan includes 5 GB a month, then each GB costs $0.15, charged to the card, and no spend limit caps it. Everything the service serves is public and never cached, its database at `/state/paper_systematic.db` (about 6-7 MB by the end) included, so anyone with the address can download it as often as they like. Normal use stays around a gigabyte a month (RUNBOOK sections 9 and 13.4). GitHub stays free.
+
+**Nothing here places real orders or needs keys.** The service's one setting is `DUO_DATA_DIR`. It has no secrets, and reads only public Kraken and Binance prices.
+
 ## Running the paper test on GitHub Actions
 
-The paper test can run on GitHub's machines instead, so the laptop can be shut down. GitHub Pages can only host static files, so it shows the status page but can't run the bot. GitHub Actions runs the bot: on a schedule it starts a fresh machine, restores the paper run's state, runs one poll (`python -m duo tick`), saves the state, and publishes the status page to Pages. It's all in `.github/workflows/paper.yml`, a workflow called **Paper run**, and RUNBOOK section 12 is the step-by-step guide.
+Until the cutover to Render (RUNBOOK 13.3), the paper test runs on GitHub's machines, and it runs there again if it goes back (RUNBOOK 13.9). GitHub Pages can only host static files, so it shows the status page but can't run the bot. GitHub Actions runs the bot: on a schedule it starts a fresh machine, restores the paper run's state, runs one poll (`python -m duo tick`), saves the state, and publishes the status page to Pages. It's all in `.github/workflows/paper.yml`, a workflow called **Paper run**, and RUNBOOK section 12 is the step-by-step guide.
 
 - **Where:** the public repository `mattthewhiggins/duo-paper`. The status page is **https://mattthewhiggins.github.io/duo-paper/**, and like the repository it's public: anyone can see the paper trades.
 - **When, in UTC:** every 15 minutes from 00:05 to 03:50, while the day's decision is made and its orders are worked; hourly at :35 for the rest of the day; and at 23:47, so the next day's loss limit starts from a reading just before midnight. GitHub starts scheduled runs late when it's busy, often by 5 to 60 minutes, and sometimes skips one.
-- **The state** is `data/` (the database and the heartbeat file), kept on its own branch, `paper-state`. Each run restores it and saves it back. The branch keeps one commit per UTC day, so it's a daily snapshot, and `main` only ever holds code.
+- **The state** is `data/` (the database and the heartbeat file), kept on its own branch, `paper-state`. Each run restores it and saves it back. The branch keeps one commit per UTC day, so it's a daily snapshot, and `main` only ever holds code. At the cutover, `data/` loses its database (RUNBOOK 13.3) for a note, `data/MOVED_TO_RENDER.md`, so any Paper run then stops before its tick, with "The paper run is on Render", and the branch then holds Render's copy in `data/render/`.
 - **Using it:** in the repository's Actions tab, open Paper run, press Run workflow and pick an action. `start` begins the paper run: run it once. `tick` runs an extra poll now. `resume` lifts the kill switch, then polls. `flatten` sells everything and halts. `probe` checks that Kraken and Binance answer from GitHub's machines, and changes nothing. Until `start` has run, scheduled runs do nothing and say so, without failing. If `start` fails, or its state can't be saved, no paper run has begun: the run says so, and you run `start` again. Runs never overlap: a run that starts while another is going waits its turn, in order.
 - **Checking on it:** the status page shows the last run and what it found: "Running normally", "Needs attention" (with the reason, such as a tick that didn't finish or today's decision overdue) or "Halted". When no run has updated it for about 3¼ hours (195 minutes), it says "Stale", or "Finished" once the 28-day test is complete. The Actions tab lists every run, and each run's summary says what its tick did.
 - **Failure emails:** GitHub emails you when a run fails, if your notification settings let it (RUNBOOK 12.2). A run fails when its tick fails or is stopped after 270 seconds, or the state can't be restored or saved. It fails when the Install step, the page's build or upload, or the `deploy` job that publishes the page fails. And it fails when the watchdog finds the runner halted, degraded for too long, its decision overdue, or that the run wrote no heartbeat. While the cause lasts, every run fails. **Missed or stopped runs send no email:** a run that never starts can't fail, so if GitHub stops starting the scheduled runs, only the page's "Stale" notice and the Actions list show it. Look at one of them every day.
-- **Stopping it:** the runs don't stop by themselves. When the page says the 28-day test is complete (28 finished days compared), disable the workflow (Actions tab, Paper run, the `...` menu, Disable workflow), or run `gh workflow disable "Paper run" -R mattthewhiggins/duo-paper`. That's the end of the test, and the same stops it at any other time. Nothing more runs or trades, and the state stays on `paper-state` if you enable it again later.
+- **Stopping it:** the runs don't stop by themselves. Disabling the workflow (Actions tab, Paper run, the `...` menu, Disable workflow, or `gh workflow disable "Paper run" -R mattthewhiggins/duo-paper`) stops them, and nothing more runs or trades. It's the cutover's first step on GitHub (RUNBOOK 13.3), and it would end the test if the test were still on GitHub when the page says it's complete (28 finished days compared). Enabling it again carries on from the state on `paper-state`, but after the cutover that state is on Render, so going back is RUNBOOK 13.9.
 
-How it differs from the laptop's loop:
+How it differs from the laptop's loop, which is also how the days before the move differ from those on Render:
 
 - **The decision** is made at the first run after 00:02 UTC that sees the just-closed bar: normally the 00:05 run, later when GitHub starts it late. The overdue alert waits until 02:00 UTC.
 - **Resting orders** are judged on Kraken's 1-minute candles between runs, by the same paper rule, since nothing watches the book then. The laptop checks a fresh quote every 10 seconds. Only a gap of more than 3 hours since the last run counts as an outage: then each resting order is still judged on the candles over its life, and closes unfilled if nothing traded through it.
@@ -88,11 +114,11 @@ How it differs from the laptop's loop:
 
 **Costs:** none. Actions on GitHub's standard machines and Pages are free for public repositories.
 
-**GitHub's terms** allow Actions for developing and testing the software project in the repository. This paper test is a time-boxed test of this project, stopped at its end by disabling the workflow ("Stopping it" above), so it fits. A live trading bot isn't a test, and would need its own server (see "Moving to a server").
+**GitHub's terms** allow Actions for developing and testing the software project in the repository. This paper test is a time-boxed test of this project, stopped at its end, so it fits. After the cutover, GitHub runs only the Render backup workflow's copy and a static page, part of the same test. A live trading bot isn't a test, and would need its own server (see "Moving to a server").
 
-**Nothing here places real orders or needs keys.** The workflow has no secrets and reads only public Kraken and Binance prices.
+**Nothing here places real orders or needs keys.** The workflows have no secrets. They read only public Kraken and Binance prices, and the Render service's own backup and page.
 
-**What's published.** `.venv/bin/python ops/publish_repo.py TARGET_DIR` copies only the files the run and its tests need (the code, the tests, `config.toml`, the research cost model, this README and the RUNBOOK) into a clone of the public repository. It deletes anything there that's no longer on its list. It stops without changing anything if a file is called `.env` or isn't UTF-8 text, if a file on its list is a link, or if a file holds a path under /Users (also written with dashes for slashes, as in a Claude session folder's name), an email address other than a GitHub no-reply or example one, or something shaped like a key (an Anthropic, GitHub or AWS key, a private key, or one of this project's key settings with a value). It checks for nothing else, so look over the copy before you push it. It doesn't commit or push. `RESULTS.md`, `AUDIT.md` and the research write-ups and results are kept privately.
+**What's published.** `.venv/bin/python ops/publish_repo.py TARGET_DIR` copies only the files the run and its tests need (the code, `ops/render/` and `.python-version` for Render, both workflows, the tests, `config.toml`, the research cost model, this README and the RUNBOOK) into a clone of the public repository, which Render builds from and GitHub Actions runs. It deletes anything there that's no longer on its list. It stops without changing anything if a file is called `.env` or isn't UTF-8 text, if a file on its list is a link, or if a file holds a path under /Users (also written with dashes for slashes, as in a Claude session folder's name), an email address other than a GitHub no-reply or example one, or something shaped like a key (an Anthropic, GitHub or AWS key, a private key, or one of this project's key settings with a value). The SSH addresses git and Render use are written like email addresses, so they're refused too. It checks for nothing else, so look over the copy before you push it. It doesn't commit or push. `RESULTS.md`, `AUDIT.md` and the research write-ups and results are kept privately.
 
 ## Going live with the systematic runner
 
@@ -240,15 +266,17 @@ Copy the folder to an always-on Linux machine, create the virtualenv, and run `.
 
 Leave the dashboard on `127.0.0.1` and reach it through an SSH tunnel: `ssh -L 8787:127.0.0.1:8787 your-server`. If you do expose it, set `DUO_DASHBOARD_TOKEN` and put it behind HTTPS. Restrict the Kraken key to the server's IP address.
 
+The paper test does this on Render ("Running the paper test on Render"): a Linux service runs `python -m duo run` under `ops/render/serve.py` instead of systemd. Its dashboard stays on 127.0.0.1 inside the service and isn't exposed: the public page on Render's port is the static status page.
+
 ## Tests
 
 ```bash
 .venv/bin/python -W ignore::ResourceWarning -m unittest discover -s tests -t .
 ```
 
-The tests never spend money or reach private Kraken endpoints, and never touch the network at all for the systematic runner: Binance and Kraken are stand-ins. `tests/test_sys_parity.py` takes about 1½ minutes, because it rebuilds the runner's panel for each of 120 development days; where the research's development panel isn't there, as in the public repository, its 2 tests are skipped. They cover the ledger, every limit, the conversation loop, failure handling, the dashboard and the status page. The status page's tests that run its script in Node.js are skipped where Node.js isn't installed. The Anthropic SDK and the Kraken order code run against local stand-ins, which can't prove the real services accept the requests.
+The tests never spend money or reach private Kraken endpoints, and never touch the network at all for the systematic runner: Binance and Kraken are stand-ins. `tests/test_sys_parity.py` takes about 1½ minutes, because it rebuilds the runner's panel for each of 120 development days; where the research's development panel isn't there, as in the public repository, its 2 tests are skipped. They cover the ledger, every limit, the conversation loop, failure handling, the dashboard and the status page, the GitHub workflows, and the Render service's supervisor, its Shell controls and the backup pull. The status page's tests that run its script in Node.js are skipped where Node.js isn't installed. The Anthropic SDK, the Kraken order code, Render and GitHub are local stand-ins, which can't prove the real services accept the requests.
 
-**The tests don't depend on the shipped config.** They set the limits they test themselves (`TEST_LIMITS` in `tests/sys_helpers.py`), so changing the strategy or `max_asset_pct` in `config.toml` doesn't change what they check. Run on 5 November 2026 with the shipped config, the suite ran 418 tests: OK.
+**The tests don't depend on the shipped config.** They set the limits they test themselves (`TEST_LIMITS` in `tests/sys_helpers.py`), so changing the strategy or `max_asset_pct` in `config.toml` doesn't change what they check. Run on 7 November 2026 with the shipped config, the suite ran 603 tests: OK.
 
 ## Files
 
@@ -269,11 +297,15 @@ The tests never spend money or reach private Kraken endpoints, and never touch t
 | `duo/sys_research.py` | Strategy ids, targets and DCA from the research's own code, read-only |
 | `duo/sys_data.py`, `duo/sys_market.py` | Binance public daily klines into the research's panel, and Kraken public quotes |
 | `duo/compare.py` | Paper against the research backtest |
-| `duo/watchdog.py`, `ops/` | The watchdog, and launchd templates (not installed, and in the private working copy only) |
-| `.github/workflows/paper.yml`, `ops/actions/` | The paper test on GitHub Actions, and the scripts that restore and save its state branch |
-| `duo/site.py`, `duo/static/site.html` | The status page GitHub Pages shows (`python -m duo site`) |
-| `requirements-paper.txt` | What the GitHub Actions run installs: numpy, pinned by version and by the hash of its file |
-| `ops/publish_repo.py` | Copies the published files into the public repository, after checking them |
+| `duo/watchdog.py`, `ops/*.plist` | The watchdog, and the Mac's launchd templates (not installed, and in the private working copy only) |
+| `ops/render/serve.py` | Render's start command: the supervisor that runs the bot, serves the page, `/ok` and `/supervisor.json`, and backs the database up |
+| `ops/render/ctl.py` | The controls typed in the Render service's Shell, and the seed that moves the run there |
+| `.github/workflows/render-backup.yml`, `ops/render/pull_backup.py` | GitHub's side of the run on Render: the copy of its backup in `data/render/` on `paper-state`, and the github.io page that takes readers to the service |
+| `.python-version` | The Python Render installs: 3.13 |
+| `.github/workflows/paper.yml`, `ops/actions/` | The paper test on GitHub Actions, before the move to Render and for going back, and the scripts that restore and save its state branch |
+| `duo/site.py`, `duo/static/site.html` | The status page: built read-only beside the loop on Render (`python -m duo.site`), and by `python -m duo site` on GitHub Actions |
+| `requirements-paper.txt` | What Render's build and the GitHub Actions run install: numpy, pinned by version and by the hash of its file |
+| `ops/publish_repo.py` | Copies the published files into the public repository, which Render builds from, after checking them |
 | `duo/AUDIT_STATUS.md` | Each audit finding: fixed, not applicable, or left for live (kept privately) |
 
 The public repository holds only the files its paper run and tests need. `RESULTS.md`, `AUDIT.md`, `duo/AUDIT_STATUS.md`, the research write-ups (`research/*.md`) and the research's results under `research/artifacts/`, apart from the cost model, are kept privately; audit findings are numbered as in `AUDIT.md`.

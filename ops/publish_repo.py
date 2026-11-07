@@ -1,8 +1,11 @@
 """python ops/publish_repo.py TARGET_DIR: copies what the public repository needs into TARGET_DIR, after checking it.
 
-The public repository (mattthewhiggins/duo-paper on GitHub) runs the paper test on GitHub Actions
-(.github/workflows/paper.yml). It gets the files on WHITELIST and nothing else: no data/, no .env, no .venv, and none of
-the research write-ups, results or audit, which are kept privately.
+The public repository (mattthewhiggins/duo-paper on GitHub) is what Render builds the paper test's service from
+(ops/render/, with .python-version naming its Python), and what GitHub Actions runs the Render backup workflow from
+(.github/workflows/render-backup.yml). Paper run (.github/workflows/paper.yml), which ran the test on GitHub Actions
+before the move, stays on the list for going back: a file taken off it is deleted from TARGET_DIR. The repository gets
+the files on WHITELIST and nothing else: no data/, no .env, no .venv, and none of the research write-ups, results or
+audit, which are kept privately.
 
 The copy is made in a temporary folder and checked there first. If any file is called .env, isn't UTF-8 text, or holds
 a path into a Mac's home folders (under /Users, or with dashes for slashes, as Claude names its session folders), an
@@ -39,8 +42,10 @@ WHITELIST = (
     "research/artifacts/cost_model.json", "research/artifacts/cost_model.sha256",
     "tests/__init__.py", "tests/helpers.py", "tests/sys_helpers.py", "tests/test_*.py",
     "config.toml", "requirements.txt", "requirements-research.txt", "requirements-paper.txt",
-    "README.md", "RUNBOOK.md", "start.sh",
-    "ops/actions/*.sh", "ops/publish_repo.py", ".github/workflows/paper.yml",
+    "README.md", "RUNBOOK.md", "start.sh", ".python-version",
+    "ops/actions/*.sh", "ops/publish_repo.py", "ops/render/*.py",
+    # Workflows by name, so no other one is ever published by mistake.
+    ".github/workflows/paper.yml", ".github/workflows/render-backup.yml",
 )
 
 GITIGNORE = "data/\n.env\n.venv/\n__pycache__/\n*.pyc\n_site/\nstate/\n"

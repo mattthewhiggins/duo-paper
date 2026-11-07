@@ -12,10 +12,13 @@
 #   started=false  there's no paper-state branch and ACTION isn't start: the paper run hasn't been started
 #   new=true       a new paper run starts in DIR: ACTION is start, and DIR is that new branch (nothing of it is on
 #                  GitHub yet) or a paper-state with no database. The workflow keeps a new run only if its start works.
+# On a paper-state fenced for Render (below), every ACTION but backup fails instead, and writes neither.
 #
 # A branch whose data/ has no database is checked out as it is, and nothing is created in its place: the tick refuses
 # to run without one, so a lost database fails the job instead of quietly starting a new paper run. Only start begins
-# one there.
+# one there, and only on a branch that isn't fenced for Render. Since the cutover (RUNBOOK 13.3) the run is on Render,
+# and paper-state's data/ holds MOVED_TO_RENDER.md in place of the database: every action but backup, the Render
+# backup workflow's, then fails before anything is checked out, so a Paper run that runs anyway does nothing.
 set -euo pipefail
 
 usage="usage: restore_state.sh DIR ACTION"
@@ -38,6 +41,15 @@ if [ "$found" -eq 0 ]; then
   # Depth 2, so the tip's parent is here too. save_state.sh amends the tip during the day, and amending a tip whose
   # parent a shallow fetch cut off would make a commit with no parent: the push would then wipe the daily history.
   git fetch --quiet --no-tags --depth=2 origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+  # The cutover's fence (RUNBOOK 13.3 step 5). The note alone decides, so a branch with a database beside it is refused
+  # too: going back (RUNBOOK 13.9) takes the note away in the commit that puts the database back.
+  if git cat-file -e "refs/remotes/origin/$branch:data/MOVED_TO_RENDER.md" 2>/dev/null && [ "$action" != backup ]; then
+    echo "::error title=The paper run is on Render::$branch's data/MOVED_TO_RENDER.md says the paper run has moved to" \
+      "Render, so this run did nothing. Paper run must stay disabled (if it's enabled: gh workflow disable" \
+      "\"Paper run\" -R mattthewhiggins/duo-paper), and its start must never run now (RUNBOOK 13.10). A scheduled run" \
+      "GitHub started late needs nothing more (RUNBOOK 13.3 step 9). Going back to GitHub is RUNBOOK 13.9."
+    exit 1
+  fi
   git worktree add --quiet -B "$branch" "$dir" "refs/remotes/origin/$branch"
   echo "Restored the paper state from $branch, $(TZ=UTC git -C "$dir" log -1 \
     --format='commit %h saved %cd' --date=format-local:'%Y-%m-%d %H:%M UTC')."
@@ -46,7 +58,9 @@ if [ "$found" -eq 0 ]; then
     # As on a new branch, a start that fails here must not become the paper run.
     echo "$branch has no data/paper_systematic.db, so this starts a new paper run in $dir."
     new=true
-  elif [ ! -f "$dir/data/paper_systematic.db" ]; then
+  elif [ ! -f "$dir/data/paper_systematic.db" ] && [ "$action" != backup ]; then
+    # Not for Render backup (action backup): since the cutover the database is on Render, and that workflow keeps
+    # Render's copies in data/render/ instead.
     echo "::warning::$branch has no data/paper_systematic.db, so the tick will refuse to run rather than start a new" \
       "paper run on its own. If the run's database is really gone, run the workflow with action start to begin" \
       "a new one."
@@ -63,8 +77,11 @@ elif [ "$found" -eq 2 ] && [ "$action" = start ]; then
   echo "started=true" >> "$output"
   echo "new=true" >> "$output"
 elif [ "$found" -eq 2 ]; then
-  echo "::notice title=Paper run not started::There's no $branch branch, so the paper run hasn't been started and" \
-    "this run did nothing. To start it, run the Paper run workflow once with action start."
+  # Not for Render backup (action backup): its Pull step says what to do when there's no paper-state.
+  if [ "$action" != backup ]; then
+    echo "::notice title=Paper run not started::There's no $branch branch, so the paper run hasn't been started and" \
+      "this run did nothing. To start it, run the Paper run workflow once with action start."
+  fi
   echo "started=false" >> "$output"
   echo "new=false" >> "$output"
 else

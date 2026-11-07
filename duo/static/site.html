@@ -7,12 +7,13 @@
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex">
 <meta name="color-scheme" content="light dark">
-<meta name="description" content="A paper-trading run of a research strategy: no real money, rebuilt after every scheduled run.">
+<meta name="description" content="A paper-trading run of a research strategy: no real money.">
 <title>Duo paper run</title>
 <link rel="icon" href="data:,">
 <style>
-/* Duo paper run: the status page GitHub Pages serves. Everything it shows comes from status.json, built by
-   duo/site.py after each scheduled run. No external requests: no CDN, no web fonts. */
+/* Duo paper run: the status page GitHub Pages or the Render service serves. Everything it shows comes from status.json,
+   built by duo/site.py after each scheduled run on GitHub, or every 5 minutes on Render. No external requests: no CDN,
+   no web fonts. */
 :root {
   color-scheme: light;
   --page: #f9f9f7;
@@ -244,7 +245,7 @@ td ul { margin: 0; padding-left: 16px; }
   <div class="wrap">
     <p class="kicker">Paper trading · no real money</p>
     <h1>Duo paper run</h1>
-    <p class="lede" id="lede">Simulated orders at real prices, rebuilt after every scheduled run. No exchange keys, no real money. Not financial advice, and not a recommendation to buy, sell or hold anything.</p>
+    <p class="lede" id="lede">Simulated orders at real prices. No exchange keys, no real money. Not financial advice, and not a recommendation to buy, sell or hold anything.</p>
   </div>
 </header>
 
@@ -337,20 +338,24 @@ td ul { margin: 0; padding-left: 16px; }
 </main>
 
 <footer class="wrap site-foot">
-  <p id="foot-built">Built by duo/site.py from the run's database after each run.</p>
+  <p id="foot-built">Built by duo/site.py from the run's database.</p>
   <p>Data: <a href="status.json">status.json</a><span id="foot-links"></span></p>
 </footer>
 
 <script>
 "use strict";
 (() => {
-  const REFRESH_SECONDS = 300;      // status.json is rebuilt after each run, at most every 15 minutes.
+  const REFRESH_SECONDS = 300;      // status.json is rebuilt after each run on GitHub, at most every 15 minutes, and
+                                    // every 5 minutes on Render.
   const LINE_GAP_SECONDS = 6 * 3600; // Runs further apart than this aren't joined: nothing was checked in between.
-  const JOB_SECONDS = 900;          // A run builds the page within this of its tick starting (its job has 15 minutes).
-  const TICK_SECONDS = 600;         // Only for a database from before tick_at: a heartbeat this much older than the
-                                    // page means the run's tick wrote none.
+  const JOB_SECONDS = 900;          // GitHub only: a run builds the page within this of its tick starting (its job has
+                                    // 15 minutes).
+  const TICK_SECONDS = 600;         // GitHub only, and only for a database from before tick_at: a heartbeat this much
+                                    // older than the page means the run's tick wrote none.
   const DISCLAIMER = "Not financial advice, and not a recommendation to buy, sell or hold anything.";
   const HALTED_TEXT = "No decision is made while the run is halted, until it's resumed with the workflow's resume action.";
+  const HALTED_LOOP = "No decision is made while the run is halted, until it's resumed with python3 ops/render/ctl.py resume, in the service's Shell on Render (RUNBOOK section 13.5).";
+  const HELD_LOOP = "No decision is made while the loop is held: it's made at the first loop after the hold comes off (RUNBOOK section 13.6).";
   const MINUS = "−";
   const DASH = "—";
   const SVGNS = "http://www.w3.org/2000/svg";
@@ -358,6 +363,16 @@ td ul { margin: 0; padding-left: 16px; }
 
   const byId = (id) => document.getElementById(id);
   const isNum = (v) => typeof v === "number" && Number.isFinite(v);
+  // Which host runs the run, from status.json's host: Render's nonstop loop, or GitHub Actions' scheduled runs (also
+  // any status.json from before host was recorded). The page judges the run by that host's schedule and gives that
+  // host's instructions.
+  const loopMode = (d) => (d.host || {}).schedule === "loop";
+  const haltedText = (d) => (loopMode(d) ? HALTED_LOOP : HALTED_TEXT);
+  // On Render, once the 28 days are compared, holding the loop is how the test ends (RUNBOOK section 13.8).
+  const ended = (d) => loopMode(d) && (d.host || {}).held === true && d.start && d.start.complete;
+  const heldSince = (d) => (isNum((d.host || {}).held_since) ? ` since ${when(d.host.held_since)}` : "");
+  // When something due is made: at GitHub's first run after its time, or at the loop's first check from it.
+  const firstRun = (d, ts) => `${loopMode(d) ? "the first loop from" : "the first run after"} ${when(ts)}`;
 
   // ---- Formatting ----
 
@@ -568,6 +583,7 @@ td ul { margin: 0; padding-left: 16px; }
     const midnight = utcMidnight(now), builtToday = utcMidnight(d.generated_at) === midnight;
     return {
       halted: t.halted === true,
+      held: loopMode(d) && (d.host || {}).held === true,  // On Render: the loop is stopped until the hold comes off.
       // Today's decision is on the bar that closed at 00:00 UTC today.
       decided: last ? isNum(last.bar_at) && last.bar_at >= midnight - 86400 : builtToday && t.decided === true,
       due: isNum(t.due_from) ? midnight + (t.due_from % 86400) : null,  // Its time of day, today.
@@ -594,12 +610,19 @@ td ul { margin: 0; padding-left: 16px; }
   function progress(d, now) {
     const start = d.start, target = start.target_days;
     if (start.complete) {
-      return `the ${target}-day test is complete (${whole(start.days_compared)} finished days compared), and the runs carry on until the workflow is disabled (RUNBOOK section 12.6)`;
+      const after = ended(d) ? `the loop has been held${heldSince(d)}, which ended it (RUNBOOK section 13.8)`
+        : loopMode(d) ? "the loop carries on until it's stopped at the end (RUNBOOK section 13.8)"
+        : "the runs carry on until the workflow is disabled (RUNBOOK section 12.6)";
+      return `the ${target}-day test is complete (${whole(start.days_compared)} finished days compared), and ${after}`;
     }
     return `day ${dayNumber(d, now)}, and ${isNum(start.days_compared) ? whole(start.days_compared) : DASH} of ${target} finished days compared`;
   }
 
   function banner(d) {
+    if (loopMode(d)) {
+      loopBanner(d);
+      return;
+    }
     const now = nowSeconds();
     const hb = d.heartbeat;
     const staleAfter = (isNum(d.stale_after_minutes) ? d.stale_after_minutes : 195) * 60;
@@ -658,6 +681,84 @@ td ul { margin: 0; padding-left: 16px; }
     }
   }
 
+  // On Render the loop checks every 5 minutes and the service rebuilds this page as often, so the run is judged by the
+  // loop's own limits: checks missed once its heartbeat is two loops and a minute old (the runner's outage rule), the
+  // loop stopped once it's heartbeat_stale_minutes old (the watchdog's), and this page stale a loop after that. The
+  // heartbeat's age is by the reader's clock, up to a loop past the build: the service builds 45 s after each loop, so
+  // at its builds a loop that stopped has a heartbeat 10:45 or 15:45 old, never in between, and the reader's clock
+  // catches each limit as it passes, in step with the watchdog, whichever build the reader holds. The cap keeps a late
+  // refresh, or a build that missed a slow decision loop's heartbeat, from a false alarm: a loop past any build, a
+  // healthy loop's heartbeat is at most about 10:45 old. A hold is on purpose, and once the 28 days are done it's how
+  // the test ends, however old the page.
+  function loopBanner(d) {
+    const now = nowSeconds();
+    const hb = d.heartbeat, host = d.host, start = d.start;
+    const staleAfter = (isNum(d.stale_after_minutes) ? d.stale_after_minutes : 20) * 60;
+    const lateAfter = (isNum(host.beat_late_minutes) ? host.beat_late_minutes : 11) * 60;
+    const downAfter = (isNum(host.beat_stale_minutes) ? host.beat_stale_minutes : 15) * 60;
+    const every = duration(isNum(host.loop_minutes) ? host.loop_minutes : 5);
+    const age = now - d.generated_at;
+    const beatAge = hb ? Math.min(now, d.generated_at + (isNum(host.loop_minutes) ? host.loop_minutes : 5) * 60) - hb.at
+      : null;
+    const since = heldSince(d);
+    const last = !hb ? "No check has been made yet."
+      : isNum(host.moved_at) ? `The loop's last check was ${when(hb.at)}, ${ago(now - hb.at)}.`
+      : `GitHub Actions' last run was ${when(hb.at)}, ${ago(now - hb.at)}.`;
+    if (ended(d)) {
+      setBanner("finished", "Finished", [
+        `The ${start.target_days}-day test is complete, with ${whole(start.days_compared)} finished days compared, and the loop has been held${since}.`,
+        `That's how the test ends on Render (RUNBOOK section 13.8). ${last} This page was rebuilt ${when(d.generated_at)}.`,
+      ], "If the loop should still be running, take the hold off (RUNBOOK section 13.6).");
+    } else if (!start) {
+      setBanner("waiting", "No paper run yet", ["There's no paper run on the service's disk yet. It's seeded from GitHub once, at the cutover (RUNBOOK section 13.3), and the loop never starts one by itself."]);
+    } else if (age > staleAfter) {
+      setBanner("stale", "Stale: not updated lately", [
+        `This page was last rebuilt ${when(d.generated_at)}, ${ago(age)}. ${last}`,
+        `The service rebuilds this page every ${every}, so the figures below may be out of date.`,
+      ], "Check the service's Events and Logs on Render.");
+    } else if (host.held) {
+      setBanner("waiting", "Held", [
+        `Held on purpose${since}: the loop is stopped, and stays stopped until the hold is taken off (RUNBOOK section 13.6).`,
+        last,
+      ]);
+    } else if (!hb || !isNum(host.moved_at)) {
+      setBanner("waiting", "Waiting for the loop's first check", [
+        `The paper run is on the service's disk, but the loop hasn't checked the market on Render yet.${isNum(host.last_cron_at) ? ` GitHub Actions' last run was ${when(host.last_cron_at)}, ${ago(now - host.last_cron_at)}.` : ""}`,
+      ], "The loop checks once as soon as it starts. If this lasts more than a few minutes, the service's Logs on Render say why.");
+    } else if (beatAge > downAfter) {
+      setBanner("stale", "Stale: the loop has stopped", [
+        `The page was rebuilt ${when(d.generated_at)}, but the loop's last check was ${when(hb.at)}, ${ago(now - hb.at)}.`,
+        "The loop has stopped: the service's Logs on Render say why.",
+      ]);
+    } else {
+      const v = todayNow(d, now);
+      const failed = beatAge > lateAfter
+        ? `The loop has missed its last checks: it checks every ${every}, and the last was ${when(hb.at)} (${ago(now - hb.at)}). The service's Logs on Render say why. The figures below are from that check.`
+        : null;
+      const overdue = v && isNum(v.overdue)
+        ? `Today's decision is ${duration(v.overdue)} overdue, although the loop is running: python3 ops/render/ctl.py events, in the service's Shell on Render, says why (RUNBOOK section 13.4).`
+        : null;
+      if (hb.status === "halted") {
+        setBanner("halted", "Halted", [
+          hb.reasons && hb.reasons.length ? hb.reasons : ["The kill switch is on. Nothing new trades until it's resumed."],
+          failed || `Last check ${when(hb.at)}, ${ago(now - hb.at)}.`,
+        ], "To resume: run python3 ops/render/ctl.py resume in the service's Shell on Render (RUNBOOK section 13.5). The loop picks it up at its next check.");
+      } else if (failed) {
+        setBanner("attention", "Needs attention", [failed]);
+      } else if (hb.status === "degraded") {
+        setBanner("attention", "Needs attention", [
+          overdue,
+          `At the last check, ${when(hb.at)} (${ago(now - hb.at)}), the runner wasn't trading normally:`,
+          hb.reasons && hb.reasons.length ? hb.reasons : ["It didn't say why."],
+        ], "Most of these clear by themselves at a later check. The kill switch is the only one that waits for you.");
+      } else if (overdue) {
+        setBanner("attention", "Needs attention", [overdue, `Last check ${when(hb.at)}, ${ago(now - hb.at)}.`]);
+      } else {
+        setBanner("ok", "Running normally", [`Last check ${when(hb.at)}, ${ago(now - hb.at)}. Every check passed.`]);
+      }
+    }
+  }
+
   function tile(label, value, subs, cls) {
     return el("article", { class: "tile" }, el("h3", { text: label }),
       el("p", { class: "value" + (cls ? ` ${cls}` : "") }, value),
@@ -699,9 +800,9 @@ td ul { margin: 0; padding-left: 16px; }
     // The paper strategy's own state, from its latest decision: what it holds, and why.
     const last = (d.decisions || [])[0];
     const which = last ? "Today's decision" : "The first decision";
-    const pending = !v ? null : v.halted ? HALTED_TEXT : v.decided ? null
+    const pending = !v ? null : v.halted ? haltedText(d) : v.decided ? null : v.held ? HELD_LOOP
       : isNum(v.overdue) ? `${which} is ${duration(v.overdue)} overdue: see Run health below.`
-      : `${which} is due at the first run after ${when(v.due)}.`;
+      : `${which} is due at ${firstRun(d, v.due)}.`;
     if (last) {
       const on = last.signal_on;
       const where = isNum(last.close) && isNum(last.average)
@@ -951,7 +1052,7 @@ td ul { margin: 0; padding-left: 16px; }
       { label: avgDays ? `${avgDays}-day average` : "Average", num: true }, { label: "Signal" },
       { label: "Volatility, a year", num: true }, { label: "Target in BTC", num: true },
       { label: "What it decided, and what happened", cls: "wide" },
-    ], rows, `No decision yet.${!v ? "" : v.halted ? ` ${HALTED_TEXT}` : ` The first is due at the first run after ${when(v.due)}.`}`);
+    ], rows, `No decision yet.${!v ? "" : v.halted ? ` ${haltedText(d)}` : v.held ? ` ${HELD_LOOP}` : ` The first is due at ${firstRun(d, v.due)}.`}`);
     const latest = list[0];
     const volDays = ((d.strategy || {}).params || {}).W;
     fill("decisions-note", "One a day, on the daily bar that closed at 00:00 UTC. ",
@@ -1099,11 +1200,44 @@ td ul { margin: 0; padding-left: 16px; }
     return `${plural(runs, "run")} (including any started by hand) for ${plural(slots, "scheduled slot")}`;
   }
 
+  // The loop's checks in a window against the grid points due in it, both counted from the move to Render at the
+  // earliest. A start or restart adds a check off the grid, so there can be one more than were due.
+  function checkCount(d, checks, due, cut) {
+    const host = d.host;
+    if (!isNum(host.moved_at)) return "None yet: the loop hasn't checked on Render";
+    if (!isNum(checks) || !isNum(due)) return DASH;
+    return `${plural(checks, "check")}${cut ? ` since the move to Render on ${when(host.moved_at)}` : ""}; ${whole(due)} ${due === 1 ? "was" : "were"} due (one every ${duration(host.loop_minutes)})`;
+  }
+
+  // Run health on Render: the loop's own schedule and checks, and where the run was before it moved.
+  function loopHealth(d, now, v) {
+    const r = d.runs, hb = d.heartbeat, host = d.host, schedule = r.schedule || {};
+    return [
+      [isNum(host.moved_at) ? "Last check" : "Last run", r.last_at ? `${when(r.last_at)}, ${ago(now - r.last_at)}` : "None yet",
+        hb ? `${hb.status_text}.${hb.reasons && hb.reasons.length ? ` ${hb.reasons.join(" ")}` : ""}` : null],
+      ["Loop", schedule.summary || DASH, "Render runs it nonstop. A start or restart adds one check straight away."],
+      ["Checks in the last 24 hours", checkCount(d, r.last_24h, r.scheduled_24h, r.since_move_24h),
+        isNum(r.longest_gap_24h_minutes) ? `Longest gap between checks: ${duration(r.longest_gap_24h_minutes)} (the loop's longest is ${duration(r.scheduled_longest_gap_minutes)}).` : null],
+      ["Checks in the last 7 days", checkCount(d, r.last_7d, r.scheduled_7d, r.since_move_7d)],
+      ["Runs and checks since the start", whole(r.total), r.first_at ? `The first was ${when(r.first_at)}.` : null],
+      ["Schedule", `${whole(schedule.per_day)} checks a day`],
+      ["Where it runs", isNum(host.moved_at) ? `Render since ${when(host.moved_at)}` : "Render, with no check there yet",
+        isNum(host.cron_runs) && host.cron_runs > 0 ? `Before that GitHub Actions ran ${plural(host.cron_runs, "run")}, ${when(r.first_at)} to ${when(host.last_cron_at)}.` : null,
+        isNum(host.move_gap_minutes) ? `Nothing was checked for ${duration(host.move_gap_minutes)} during the move.` : null],
+      ["Today's decision", !v ? DASH : v.decided ? "Made" : v.halted ? "None while halted" : v.held ? "None while held"
+        : "Not made yet",
+        !v ? null : v.halted ? haltedText(d) : v.decided ? null
+          : v.held ? (ended(d) ? `The ${d.start.target_days}-day test is complete, and the loop has been held, which ended it (RUNBOOK section 13.8).` : HELD_LOOP)
+          : isNum(v.overdue) ? `Overdue by ${duration(v.overdue)}: the loop has checked since it was due, and none has made it. python3 ops/render/ctl.py events, in the service's Shell on Render, says why (RUNBOOK section 13.4).`
+          : `Due at ${firstRun(d, v.due)}.`],
+    ];
+  }
+
   function health(d) {
     const now = nowSeconds();
     const r = d.runs, hb = d.heartbeat, v = todayNow(d, now);
     const next = nextSlot(d, now);
-    facts("health-facts", r ? [
+    facts("health-facts", r && loopMode(d) ? loopHealth(d, now, v) : r ? [
       ["Last run", r.last_at ? `${when(r.last_at)}, ${ago(now - r.last_at)}` : "None yet",
         hb ? `${hb.status_text}.${hb.reasons && hb.reasons.length ? ` ${hb.reasons.join(" ")}` : ""}` : null],
       ["Next scheduled run", next ? when(next) : DASH, "GitHub often starts scheduled runs late, by 5 to 60 minutes when it's busy, and sometimes skips them."],
@@ -1140,8 +1274,8 @@ td ul { margin: 0; padding-left: 16px; }
     facts("about-facts", start ? [
       ["Strategy", el("code", { text: s ? s.id : DASH })],
       ["Started", when(start.at), start.complete
-        ? `The ${target}-day test is complete, with ${whole(start.days_compared)} finished days compared. The runs carry on until the workflow is disabled (RUNBOOK section 12.6).`
-        : `Day ${dayNumber(d, nowSeconds())}, and ${isNum(start.days_compared) ? whole(start.days_compared) : DASH} of ${target} finished days compared. The ${ordinal(target)} counts at the first run after ${when(start.ends_at)}, at the earliest.`],
+        ? `The ${target}-day test is complete, with ${whole(start.days_compared)} finished days compared. ${ended(d) ? `The loop has been held${heldSince(d)}, which ended it (RUNBOOK section 13.8).` : loopMode(d) ? "The loop carries on until it's stopped at the end (RUNBOOK section 13.8)." : "The runs carry on until the workflow is disabled (RUNBOOK section 12.6)."}`
+        : `Day ${dayNumber(d, nowSeconds())}, and ${isNum(start.days_compared) ? whole(start.days_compared) : DASH} of ${target} finished days compared. The ${ordinal(target)} counts at ${firstRun(d, start.ends_at)}, at the earliest.`],
       ["Starting capital", capital, `Converted at GBP/USD ${isNum(start.gbp_usd) ? start.gbp_usd.toFixed(4) : DASH}, less ${fixed(start.funding_fx_bps / 100, 2)}% for the conversion.`],
       ["Fees", `${fixed(start.maker_pct, 2)}% maker, ${fixed(start.taker_pct, 2)}% taker`, "Kraken Pro's tier 3, which the research's account size qualifies for."],
       ["Paper fills", `A resting order fills only once the market trades ${fixed(start.trade_through_pct, 2)}% through it, at its own price.`],
@@ -1202,9 +1336,10 @@ td ul { margin: 0; padding-left: 16px; }
         byId("banner-body").append(el("p", { class: "after", text: `Couldn't refresh just now (${reason}), so this is the copy from ${when(state.data.generated_at)}.` }));
         return;
       }
+      // Until status.json loads, the page can't tell which host it's on, and both serve it beside this page.
       setBanner("error", "Couldn't load the run's status", [
         `status.json didn't load: ${reason}.`,
-        "If the site was only just set up, the first run (the workflow's start action) may not have finished yet. Otherwise try again in a few minutes.",
+        "This is usually brief: try again in a few minutes.",
       ]);
     }
   }

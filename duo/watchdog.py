@@ -4,12 +4,15 @@ The bot writes data/heartbeat_systematic.json on every loop. This reads it, asks
 `pmset -g batt`, and posts a macOS notification with `osascript -e 'display notification ...'` when the heartbeat is
 stale or missing, the runner is halted, it has been degraded (placing no new orders) for longer than
 degraded_alert_minutes, today's decision is overdue, or the Mac is running on battery. An exchange outage keeps the
-loop beating, so only the last two of those would show it. It prints what it found and exits 0 if all is well, 1 if not.
+loop beating, so only the degraded and overdue checks would show it. It prints what it found, problems first, and exits
+0 if all is well, 1 if not.
 
-It's meant to run every 5 minutes from launchd (ops/com.duo.watchdog.plist), outside the bot's own process, so it still
-speaks when the bot can't. On GitHub Actions it runs at the end of every run instead, on a Linux machine with no pmset
-or osascript: there the power isn't checked, and its exit code is the alert, as a failed run that GitHub emails about.
-It reads and notifies, and changes nothing.
+On the Mac it's meant to run every 5 minutes from launchd (ops/com.duo.watchdog.plist), outside the bot's own process,
+so it still speaks when the bot can't. Elsewhere it runs on Linux, with no pmset or osascript, so the power isn't
+checked and its exit code is the alert. On GitHub Actions it runs at the end of every run, and a failure fails the run,
+which GitHub emails about. On Render, the service's supervisor (ops/render/serve.py) runs it after each rebuild of the
+page, beside the loop, and its pass or fail, with its first line, is part of the service's /ok (RUNBOOK 13.4). It reads
+and notifies, and changes nothing.
 """
 from __future__ import annotations
 

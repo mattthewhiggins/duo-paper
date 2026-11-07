@@ -895,11 +895,15 @@ class Site(unittest.TestCase):
         for words in ("doesn't exist", "paper-state has no database", "action start (RUNBOOK 12.3)",
                       "copy the GitHub run's database out first (RUNBOOK 12.7)", "./start.sh"):
             self.assertIn(words, str(stop.exception))
+        render = ("If the run has moved to Render, it's on the service's disk instead: use python3 ops/render/ctl.py "
+                  "in the service's Shell (RUNBOOK 13).")
+        self.assertIn(render, str(stop.exception))
         with self.assertRaises(SystemExit) as stop:
             cli.systematic_db(config, "resume")  # Resuming a copy on the Mac would leave the GitHub run halted.
         self.assertIn("On the Mac, this can't reach the GitHub run: resume that with the Paper run workflow's action "
                       "resume (RUNBOOK 12.5).", str(stop.exception))
         self.assertNotIn("copy the GitHub run's database out", str(stop.exception))
+        self.assertIn(render, str(stop.exception))
         self.assertFalse(config.db_path.exists())
 
 
